@@ -56,6 +56,14 @@ t = time.perf_counter()
 E.process(img, {**p, "look": "x"}, look=next(iter(looks.values())))
 print(f"обработка с пресетом: {(time.perf_counter() - t) * 1000:.0f} мс")
 
+# Сцены: у каждой есть описания для CLIP и существующий пресет, поправки не выходят за шкалы.
+scenes = E.read_json(Path(__file__).resolve().parent.parent / "scenes.json", [])
+limits = {key: (lo, hi) for key, _, lo, hi, _ in E.SLIDERS}
+for sc in scenes:
+    assert sc["prompts"] and sc["look"] in looks, sc["id"]
+    sp = E.scene_preset(img * 0.3, sc)
+    assert sp["look"] == sc["look"] and all(limits[k][0] <= sp[k] <= limits[k][1] for k in sc["params"]), sc["id"]
+
 print("авто:", E.auto_params(img * 0.3))
 assert E.auto_params(img * 0.3)["exposure"] > 0, "тёмный кадр должен осветляться"
 

@@ -1,0 +1,73 @@
+[
+  {"id": "sunset", "name": "Закат / рассвет", "icon": "🌅",
+   "prompts": ["a photo of a sunset", "a photo of a sunrise", "golden hour sky with the sun low on the horizon",
+               "orange and pink clouds at dusk"],
+   "look": "Персиковый закат", "look_strength": 85,
+   "params": {"highlights": -20, "vibrance": 10}},
+
+  {"id": "blue_hour", "name": "Сумерки", "icon": "🌆",
+   "prompts": ["a photo taken at blue hour", "twilight sky over a city", "a calm evening at dusk with deep blue sky"],
+   "look": "Лавандовые сумерки", "look_strength": 80,
+   "params": {"shadows": 20, "highlights": -15}},
+
+  {"id": "night_city", "name": "Ночной город", "icon": "🌃",
+   "prompts": ["a photo of a city at night", "neon lights on a street at night", "night street photography with lights"],
+   "look": "Неоновая пастель", "look_strength": 80,
+   "params": {"shadows": 25, "highlights": -30, "clarity": 5}},
+
+  {"id": "portrait", "name": "Портрет", "icon": "🙂",
+   "prompts": ["a portrait photo of a person", "a close-up photo of a face", "a photo of a smiling woman",
+               "a photo of a man looking at the camera"],
+   "look": "Мягкий портрет", "look_strength": 80,
+   "params": {"clarity": -10, "sharpness": 20}},
+
+  {"id": "people", "name": "Люди, свадьба", "icon": "👫",
+   "prompts": ["a photo of a couple", "a wedding photo", "a group of people outdoors", "a family photo"],
+   "look": "Fuji 400H — воздух (Хосе Вилья)", "look_strength": 85,
+   "params": {"clarity": -5, "sharpness": 20}},
+
+  {"id": "landscape", "name": "Пейзаж", "icon": "⛰",
+   "prompts": ["a landscape photo of mountains", "a wide landscape with hills and sky", "a scenic nature view"],
+   "look": "Альпийский туман", "look_strength": 75,
+   "params": {"clarity": 15, "vibrance": 10, "sharpness": 30}},
+
+  {"id": "forest", "name": "Лес, зелень", "icon": "🌲",
+   "prompts": ["a photo of a forest", "green trees and grass", "a park with green foliage"],
+   "look": "Мятный лес", "look_strength": 80,
+   "params": {"clarity": 10, "sharpness": 25}},
+
+  {"id": "sea", "name": "Море, пляж", "icon": "🌊",
+   "prompts": ["a photo of the sea", "a beach with waves", "the ocean coast", "a lake shore on a sunny day"],
+   "look": "Морской бриз", "look_strength": 80,
+   "params": {"highlights": -15, "vibrance": 10}},
+
+  {"id": "snow", "name": "Снег, зима", "icon": "❄",
+   "prompts": ["a snowy winter landscape", "a photo of snow", "mountains covered with snow"],
+   "look": "Северный снег", "look_strength": 80,
+   "params": {"exposure": 30, "highlights": -20}},
+
+  {"id": "fog", "name": "Туман", "icon": "🌫",
+   "prompts": ["a foggy landscape", "mist over a field in the morning", "a hazy misty scene"],
+   "look": "Утренний туман", "look_strength": 75,
+   "params": {"clarity": 10}},
+
+  {"id": "flowers", "name": "Цветы, поле", "icon": "🌸",
+   "prompts": ["a photo of flowers", "a lavender field", "a flower garden in bloom", "a close-up of a flower"],
+   "look": "Лавандовое поле", "look_strength": 80,
+   "params": {"vibrance": 5, "sharpness": 25}},
+
+  {"id": "street", "name": "Город, улица", "icon": "🏙",
+   "prompts": ["street photography in a city", "a photo of a city street during the day", "people walking in the city"],
+   "look": "Приглушённый город (Сол Лейтер)", "look_strength": 80,
+   "params": {"clarity": 10, "sharpness": 25}},
+
+  {"id": "architecture", "name": "Архитектура", "icon": "🏛",
+   "prompts": ["a photo of a building", "architecture photography", "a facade of a historic building"],
+   "look": "Пастельная симметрия (Уэс Андерсон)", "look_strength": 75,
+   "params": {"clarity": 15, "sharpness": 35}},
+
+  {"id": "interior", "name": "Интерьер, еда", "icon": "🍽",
+   "prompts": ["a photo of a room interior", "a cozy interior of a cafe", "a photo of food on a table", "a plate of food"],
+   "look": "Матовый минимализм (Kinfolk)", "look_strength": 80,
+   "params": {"shadows": 15, "sharpness": 20}}
+]

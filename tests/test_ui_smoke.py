@@ -72,6 +72,17 @@ if __name__ == "__main__":
         wait(app, lambda: not win.rendering and not win.dirty)
         assert win.params["look_strength"] == 60
 
+        # сцены (без модели): известная сцена → «Авто» ставит её пресет, подпись в ленте, запись в sidecar
+        win.scene_of["кадр_0.jpg"] = ["sunset", 0.9]
+        win.update_item("кадр_0.jpg")
+        assert "Закат" in win.items["кадр_0.jpg"].text()
+        win.apply_auto()
+        assert win.params["look"] == win.scene_by_id["sunset"]["look"]
+        win.save_sidecar()
+        assert E.read_json(d / ".mini_lightroom.json", {})["__scenes__"]["кадр_0.jpg"][0] == "sunset"
+        name = win.params["look"]
+        wait(app, lambda: not win.rendering and not win.dirty)
+
         # масштаб: превью 400 px меньше кадра 900 px → на 100% дорисовывается полное разрешение
         assert (win.view.src_w, win.view.src_h) == (900, 600)
         win.view.set_zoom(1.0)

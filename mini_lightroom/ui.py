@@ -63,10 +63,14 @@ from PySide6.QtWidgets import (
 )
 
 from . import engine as E
+from . import scene as S
 
 APP_DIR = Path(__file__).resolve().parent.parent
 STYLES_DIR = APP_DIR / "styles"
 LOOKS_DIR = APP_DIR / "looks"
+SCENES_FILE = APP_DIR / "scenes.json"
+MODELS_DIR = APP_DIR / "models"
+SCENES_KEY = "__scenes__"   # в sidecar: {имя файла: [id сцены, уверенность]}
 PRESETS_DIR = APP_DIR / "presets"
 SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат рядом со снимками
 PREVIEW_SIDE = 1400
@@ -134,6 +138,12 @@ def look_icons_job(path, base, params, style, looks):
     """Миниатюры текущего кадра под каждым пресетом — видно, что выбираешь."""
     small = E.process(E.resize_max(base, 84), {**params, "look": "", "vignette": 0, "sharpness": 0}, style)
     return path, {name: to_u8(E.apply_look(small, look)) for name, look in looks.items()}
+
+
+def scene_job(classifier, scenes, names, thumbs):
+    if classifier is None:  # первый раз: загрузка модели (и скачивание весов)
+        classifier = S.SceneClassifier(scenes, MODELS_DIR)
+    return classifier, names, classifier.classify(thumbs)
 
 
 def full_job(path):
@@ -385,7 +395,7 @@ class SliderRow(QWidget):
 # ---------------------------------------------------------------- экспорт
 
 class ExportDialog(QDialog):
-    def __init__(self, parent, n_selected, n_all, folder: Path):
+    def __init__(self, parent, n_selected, n_all, folder: Path, has_scenes: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Экспорт в JPEG")
         self.r_current = QRadioButton("Текущий кадр")
@@ -396,6 +406,10 @@ class ExportDialog(QDialog):
         self.auto = QCheckBox("Авто-тон для каждого кадра")
         self.auto.setToolTip("Экспозицию, света/тени и баланс белого программа подберёт под каждый снимок,\n"
                              "а стиль, сочность, чёткость и резкость возьмёт ваши.")
+        self.scene_look = QCheckBox("Пресет по сцене для каждого кадра")
+        self.scene_look.setEnabled(has_scenes)
+        self.scene_look.setToolTip("Каждый кадр получит авто-тон и пресет своей сцены (закат, портрет, лес…).\n"
+                                   "Доступно после кнопки «Сцены» на панели.")
         self.skip_blur = QCheckBox("Пропускать размытые кадры")
         self.edge = QSpinBox()
         self.edge.setRange(0, 12000)
@@ -426,7 +440,7 @@ class ExportDialog(QDialog):
         btns.rejected.connect(self.reject)
 
         lay = QVBoxLayout(self)
-        for w in (self.r_current, self.r_selected, self.r_all, hint, self.auto, self.skip_blur):
+        for w in (self.r_current, self.r_selected, self.r_all, hint, self.auto, self.scene_look, self.skip_blur):
             lay.addWidget(w)
         lay.addLayout(form)
         lay.addWidget(btns)
@@ -496,6 +510,11 @@ class MainWindow(QMainWindow):
         self.detail_pair: tuple | None = None     # (до, после, место в кадре)
         self.detail_timer = QTimer(self, singleShot=True, interval=150, timeout=self.request_detail)
         self.export_thread: ExportThread | None = None
+        self.thumbs: dict[str, np.ndarray] = {}
+        self.scene_defs: list[dict] = E.read_json(SCENES_FILE, [])
+        self.scene_by_id = {sc["id"]: sc for sc in self.scene_defs}
+        self.scene_of: dict[str, list] = {}
+        self.classifier = None
         self.thumb_pool = QThreadPool()
         self.thumb_pool.setMaxThreadCount(2)
         STYLES_DIR.mkdir(exist_ok=True)
@@ -540,6 +559,15 @@ class MainWindow(QMainWindow):
         self.auto_on_open.setChecked(True)
         self.auto_on_open.setToolTip("Кадр без правок при открытии сразу получает «Авто»")
         tb.addWidget(self.auto_on_open)
+        tb.addSeparator()
+        self.a_scenes = self._action("🔍 Сцены", self.detect_scenes, "Ctrl+Shift+S",
+                                     "Определить сцену каждого кадра: закат, портрет, лес… (ИИ локально на видеокарте)")
+        tb.addAction(self.a_scenes)
+        self.scene_auto = QCheckBox("Пресет по сцене")
+        self.scene_auto.setChecked(True)
+        self.scene_auto.setToolTip("«Авто» и новые кадры получают пресет своей сцены.\n"
+                                   "Работает для кадров, у которых сцена уже определена")
+        tb.addWidget(self.scene_auto)
         tb.addSeparator()
         self.a_zoom_out = self._action("−", lambda: self.view.step_zoom(-1), "Ctrl+-", "Уменьшить масштаб")
         self.a_zoom_in = self._action("+", lambda: self.view.step_zoom(1), "Ctrl+=", "Увеличить масштаб")
@@ -660,7 +688,7 @@ class MainWindow(QMainWindow):
     def _set_enabled(self, on):
         self.panel.setEnabled(on)
         for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_export,
-                  self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100):
+                  self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100, self.a_scenes):
             a.setEnabled(on)
         self.zoom_combo.setEnabled(on)
 
@@ -679,6 +707,8 @@ class MainWindow(QMainWindow):
         self.folder = folder
         self.files = sorted(p for p in folder.iterdir() if p.suffix.lower() in E.PHOTO_EXT)
         self.sidecar = E.read_json(folder / SIDECAR, {})
+        self.scene_of = dict(self.sidecar.get(SCENES_KEY, {}))
+        self.thumbs.clear()
         self.scores.clear()
         self.blurry.clear()
         self.items.clear()
@@ -710,14 +740,27 @@ class MainWindow(QMainWindow):
             return
         it.setIcon(QIcon(QPixmap.fromImage(to_qimage(th))))
         self.scores[Path(path).name] = score
+        self.thumbs[Path(path).name] = th
+        self.update_item(Path(path).name)
         if len(self.scores) == len(self.files) and len(self.files) >= 3:
             med = statistics.median(self.scores.values())
             self.blurry = {n for n, s in self.scores.items() if s < med * 0.3}
-            for n, item in self.items.items():
-                if n in self.blurry:
-                    item.setText(f"⚠ {n}\nвозможно, размыт")
-                    item.setForeground(QColor("#ff9b73"))
+            for n in self.items:
+                self.update_item(n)
             self.toast(f"Резкость проверена: подозрительно размытых {len(self.blurry)}")
+
+    def update_item(self, name: str):
+        """Подпись кадра в ленте: имя, пометка размытости, сцена."""
+        it = self.items.get(name)
+        if it is None:
+            return
+        lines = [f"⚠ {name}", "возможно, размыт"] if name in self.blurry else [name]
+        sc = self.scene_by_id.get(self.scene_of.get(name, [None])[0])
+        if sc:
+            lines.append(f"{sc.get('icon', '')} {sc['name']}")
+        it.setText("\n".join(lines))
+        if name in self.blurry:
+            it.setForeground(QColor("#ff9b73"))
 
     # ---------- выбор кадра
 
@@ -749,7 +792,7 @@ class MainWindow(QMainWindow):
         saved = self.sidecar.get(path.name)
         self.params = {**E.default_params(), **saved} if saved else E.default_params()
         if not saved and self.auto_on_open.isChecked():
-            self.params.update(E.auto_params(img))
+            self.params.update(self.auto_for(path.name, img)[0])
         self.sync_controls()
         self._set_enabled(True)
         self.view.message = ""
@@ -767,6 +810,8 @@ class MainWindow(QMainWindow):
 
     def save_sidecar(self):
         self.store_current()
+        if self.scene_of:
+            self.sidecar[SCENES_KEY] = self.scene_of
         if self.folder and self.sidecar:
             try:
                 E.write_json(self.folder / SIDECAR, self.sidecar)
@@ -908,10 +953,58 @@ class MainWindow(QMainWindow):
     def apply_auto(self):
         if self.base is None:
             return
-        self.params.update(E.auto_params(self.base))
+        auto, msg = self.auto_for(self.current.name, self.base)
+        self.params.update(auto)
         self.sync_controls()
         self.request_render()
-        self.toast("Авто: тон и баланс белого подобраны под кадр")
+        self.toast(msg)
+
+    # ---------- сцены (этап 1)
+
+    def scene_for(self, name: str) -> dict | None:
+        return self.scene_by_id.get(self.scene_of.get(name, [None])[0])
+
+    def auto_for(self, name: str, img: np.ndarray) -> tuple[dict, str]:
+        """Авто-параметры кадра: с пресетом сцены, если она известна и галочка включена."""
+        sc = self.scene_for(name) if self.scene_auto.isChecked() else None
+        if sc and sc.get("look") in self.looks:
+            return E.scene_preset(img, sc), f"Авто по сцене «{sc['name']}»: пресет «{sc['look']}»"
+        return E.auto_params(img), "Авто: тон и баланс белого подобраны под кадр"
+
+    def detect_scenes(self):
+        if not S.available():
+            QMessageBox.information(
+                self, "Нужны библиотеки ИИ",
+                "Для распознавания сцен нужен PyTorch (≈3 ГБ, один раз).\n"
+                "Запустите install_ai.bat в папке программы, затем перезапустите её.")
+            return
+        names = [n for n in self.items if n in self.thumbs]
+        if not names:
+            self.toast("Миниатюры ещё загружаются, попробуйте через пару секунд")
+            return
+        self.a_scenes.setEnabled(False)
+        first = self.classifier is None
+        self.toast("Загружаю модель сцен (в первый раз скачивается ~600 МБ)…" if first
+                   else f"Распознаю сцены: {len(names)} кадров…", 0)
+        run_task(scene_job, self.classifier, self.scene_defs, names, [self.thumbs[n] for n in names],
+                 done=self.on_scenes, fail=self.on_scenes_fail)
+
+    def on_scenes(self, res):
+        self.classifier, names, results = res
+        self.a_scenes.setEnabled(True)
+        counts: dict[str, int] = {}
+        for n, (sid, prob) in zip(names, results):
+            self.scene_of[n] = [sid, round(prob, 2)]
+            self.update_item(n)
+            counts[sid] = counts.get(sid, 0) + 1
+        self.save_sidecar()
+        top = ", ".join(f"{self.scene_by_id[k]['name'].lower()} {v}" for k, v in
+                        sorted(counts.items(), key=lambda kv: -kv[1])[:4])
+        self.toast(f"Сцены определены ({top}). «Авто» (A) применит пресет сцены", 10000)
+
+    def on_scenes_fail(self, msg):
+        self.a_scenes.setEnabled(True)
+        self.toast(f"Не удалось распознать сцены: {msg}", 10000)
 
     def reset_all(self):
         self.params = E.default_params()
@@ -1066,7 +1159,7 @@ class MainWindow(QMainWindow):
             return
         self.store_current()
         selected = [Path(i.data(PATH_ROLE)) for i in self.strip.selectedItems()]
-        dlg = ExportDialog(self, len(selected), len(self.files), self.folder)
+        dlg = ExportDialog(self, len(selected), len(self.files), self.folder, bool(self.scene_of))
         if not dlg.exec():
             return
         if dlg.r_all.isChecked():
@@ -1084,9 +1177,11 @@ class MainWindow(QMainWindow):
         jobs = []
         for p in paths:
             params = self.sidecar.get(p.name, self.params)
-            jobs.append({"src": str(p), "dst": str(out_dir / f"{p.stem}.jpg"), "params": params,
+            sc = self.scene_for(p.name) if dlg.scene_look.isChecked() else None
+            look = self.looks.get((sc or params).get("look") or "")
+            jobs.append({"scene": sc, "src": str(p), "dst": str(out_dir / f"{p.stem}.jpg"), "params": params,
                          "style": self.styles.get(params.get("style") or ""),
-                         "look": self.looks.get(params.get("look") or ""),
+                         "look": look,
                          "auto": dlg.auto.isChecked(), "long_edge": dlg.edge.value(),
                          "quality": dlg.quality.value()})
         self.save_sidecar()

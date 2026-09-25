@@ -408,6 +408,18 @@ def auto_params(img: np.ndarray) -> dict:
             "temperature": round(temperature), "tint": round(tint)}
 
 
+def scene_preset(img: np.ndarray, scene: dict) -> dict:
+    """Параметры под сцену: авто-тон кадра (подбор) + поправки сцены (вкус) + её пресет-образ."""
+    p = auto_params(img)
+    limits = {key: (lo, hi) for key, _, lo, hi, _ in SLIDERS}
+    for key, delta in scene.get("params", {}).items():
+        lo, hi = limits[key]
+        p[key] = int(np.clip(p.get(key, 0) + delta, lo, hi))
+    if scene.get("look"):
+        p.update(look=scene["look"], look_strength=scene.get("look_strength", 80))
+    return p
+
+
 # ---------------------------------------------------------------- LUT
 
 def export_cube(path, p: dict, style: dict | None, src_stats: dict | None, size: int = 33,
@@ -427,7 +439,9 @@ def export_cube(path, p: dict, style: dict | None, src_stats: dict | None, size:
 def export_one(job: dict) -> str:
     img = load_image(job["src"], half=False)
     params = dict(job["params"])
-    if job.get("auto"):
+    if job.get("scene"):
+        params.update(scene_preset(img, job["scene"]))  # авто-тон + пресет сцены кадра
+    elif job.get("auto"):
         params.update(auto_params(img))  # тон — под кадр, стиль и цвет — ваши
     out = process(img, params, job.get("style"), look=job.get("look"))
     if job.get("long_edge"):
