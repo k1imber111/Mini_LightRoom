@@ -38,8 +38,21 @@ SLIDERS = [
 
 def default_params() -> dict:
     p = {key: 0 for key, *_ in SLIDERS}
-    p.update(style="", style_strength=70, look="", look_strength=100)
+    # style_strength — сила цвета стиля, style_tone — сила света (тона), style_skin — защита кожи,
+    # style_mode: 0 — мягкий перенос (среднее и разброс), 1 — точный (распределения L/a/b),
+    # style2/style_mix — второй стиль и его доля в смеси.
+    p.update(style="", style_strength=70, style_tone=70, style_skin=60, style_mode=0, style2="", style_mix=50,
+             look="", look_strength=100)
     return p
+
+
+def normalize_params(saved: dict | None) -> dict:
+    """Сохранённые правки → полный набор параметров. Старые правки (до раздельных сил стиля)
+    получают силу тона, равную прежней общей силе, чтобы выглядеть как раньше."""
+    saved = dict(saved or {})
+    if "style_strength" in saved and "style_tone" not in saved:
+        saved["style_tone"] = saved["style_strength"]
+    return {**default_params(), **saved}
 
 
 LUM = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
@@ -132,10 +145,15 @@ def save_jpeg(path, img: np.ndarray, quality: int = 92) -> None:
 
 # ---------------------------------------------------------------- стиль
 
+QUANTILES = np.linspace(0, 100, 65)
+
+
 def lab_stats(img: np.ndarray) -> dict:
+    """Статистики кадра в LAB: среднее, разброс и квантили каждого канала (для точного переноса)."""
     lab = cv2.cvtColor(np.clip(resize_max(img, 512), 0, 1).astype(np.float32), cv2.COLOR_RGB2Lab)
     flat = lab.reshape(-1, 3)
-    return {"mean": flat.mean(0).tolist(), "std": flat.std(0).tolist()}
+    return {"mean": flat.mean(0).tolist(), "std": flat.std(0).tolist(),
+            "q": np.percentile(flat, QUANTILES, axis=0).T.round(3).tolist()}
 
 
 def style_from_image(path, name: str) -> dict:
@@ -143,16 +161,63 @@ def style_from_image(path, name: str) -> dict:
     return {"name": name, **lab_stats(img)}
 
 
-def _apply_style(img, style, strength, src_stats):
+def mix_styles(a: dict, b: dict, t: float) -> dict:
+    """Смесь стилей: t=0 — только a, t=1 — только b. Квантили смешиваются тоже,
+    это даёт промежуточное распределение, а не двойную картинку."""
+    out = {"name": f"{a['name']} + {b['name']}"}
+    for key in ("mean", "std", "q"):
+        if key in a and key in b:
+            out[key] = (np.array(a[key]) * (1 - t) + np.array(b[key]) * t).tolist()
+    return out
+
+
+def _skin_mask(lab: np.ndarray) -> np.ndarray:
+    """Мягкая маска тонов кожи в LAB: тёплый оттенок 25–70°, умеренная насыщенность."""
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    hue = np.degrees(np.arctan2(b, a))
+    chroma = np.hypot(a, b)
+    ramp = lambda x, lo, hi, soft: np.clip((x - lo) / soft, 0, 1) * np.clip((hi - x) / soft, 0, 1)
+    return ramp(hue, 20, 75, 10) * ramp(chroma, 6, 50, 6) * ramp(L, 20, 95, 10)
+
+
+def _transfer_curve(src_q, ref_q, span: tuple, lo: float = 0.5, hi: float = 2.0) -> tuple:
+    """Кривая «квантили кадра → квантили референса» с ограниченной крутизной.
+    Без ограничения почти однородное небо растягивается до всего диапазона референса
+    и вокруг ярких объектов появляются ореолы."""
+    grid = np.linspace(span[0], span[1], 257, dtype=np.float32)
+    raw = np.interp(grid, src_q, ref_q)
+    slope = np.clip(np.diff(raw) / np.diff(grid), lo, hi)
+    curve = np.concatenate([[0], np.cumsum(slope * np.diff(grid))])
+    mid = len(src_q) // 2  # медиана кадра попадает точно в медиану референса
+    curve += ref_q[mid] - np.interp(src_q[mid], grid, curve)
+    return grid, curve.astype(np.float32)
+
+
+def _apply_style(img: np.ndarray, style: dict, p: dict, src_stats: dict | None) -> np.ndarray:
     src = src_stats or lab_stats(img)
-    s_mean, s_std = np.array(src["mean"], np.float32), np.array(src["std"], np.float32)
-    r_mean, r_std = np.array(style["mean"], np.float32), np.array(style["std"], np.float32)
-    ratio = np.clip(r_std / (s_std + 1e-6), 0.5, 2.0)
     lab = cv2.cvtColor(np.clip(img, 0, 1).astype(np.float32), cv2.COLOR_RGB2Lab)
-    lab = (lab - s_mean) * ratio + r_mean
-    lab[..., 0] = np.clip(lab[..., 0], 0, 100)
-    out = cv2.cvtColor(lab.astype(np.float32), cv2.COLOR_Lab2RGB)
-    return img + (out - img) * strength
+    if p.get("style_mode", 0) == 1 and "q" in style and "q" in src:
+        # Точный перенос: каждый канал получает распределение референса (сопоставление по квантилям).
+        out = np.empty_like(lab)
+        for c in range(3):
+            grid, curve = _transfer_curve(src["q"][c], style["q"][c], (0, 100) if c == 0 else (-128, 128))
+            out[..., c] = np.interp(lab[..., c], grid, curve)
+    else:
+        # Мягкий перенос по Рейнхарду: среднее и разброс, отношение разбросов ограничено.
+        s_mean, s_std = np.array(src["mean"], np.float32), np.array(src["std"], np.float32)
+        r_mean, r_std = np.array(style["mean"], np.float32), np.array(style["std"], np.float32)
+        out = (lab - s_mean) * np.clip(r_std / (s_std + 1e-6), 0.5, 2.0) + r_mean
+    # Мягкий потолок сдвига: при доминирующем цвете (небо, зелень) картинка не «уплывает».
+    shift = out - lab
+    limit = np.array([40, 30, 30], np.float32)
+    shift = limit * np.tanh(shift / limit)
+    color = p.get("style_strength", 70) / 100
+    tone = p.get("style_tone", p.get("style_strength", 70)) / 100
+    if p.get("style_skin"):  # маска по исходным цветам кадра, до сдвига
+        color = (color * (1 - p["style_skin"] / 100 * _skin_mask(lab)))[..., None]
+    lab[..., 1:] += shift[..., 1:] * color
+    lab[..., 0] = np.clip(lab[..., 0] + shift[..., 0] * tone, 0, 100)
+    return cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
 
 
 # ---------------------------------------------------------------- пресеты-образы (looks)
@@ -334,7 +399,7 @@ def process(img: np.ndarray, p: dict, style: dict | None = None,
         img = gray + (img - gray) * k
 
     if style:
-        img = _apply_style(np.clip(img, 0, 1), style, p.get("style_strength", 70) / 100.0, src_stats)
+        img = _apply_style(np.clip(img, 0, 1), style, p, src_stats)
 
     if look:  # образ — финальный цвет, поверх стиля; виньетка и резкость уже после него
         img = apply_look(img, look, p.get("look_strength", 100) / 100.0)

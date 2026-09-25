@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -58,6 +59,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -144,6 +146,11 @@ def scene_job(classifier, scenes, names, thumbs):
     if classifier is None:  # первый раз: загрузка модели (и скачивание весов)
         classifier = S.SceneClassifier(scenes, MODELS_DIR)
     return classifier, names, classifier.classify(thumbs)
+
+
+def style_job(path, name):
+    img = E.load_image(path, half=True, max_side=1024)
+    return {"name": name, **E.lab_stats(img)}, to_u8(E.resize_max(img, 96))
 
 
 def full_job(path):
@@ -376,7 +383,7 @@ class SliderRow(QWidget):
     def _show(self, v):
         if self.key == "exposure":
             self.value.setText(f"{v / 100:+.2f} EV")
-        elif self.key in ("sharpness", "style_strength", "look_strength"):
+        elif self.key == "sharpness" or self.key.startswith(("style_", "look_")):
             self.value.setText(f"{v}")
         else:
             self.value.setText(f"{v:+d}" if v else "0")
@@ -633,18 +640,50 @@ class MainWindow(QMainWindow):
         # Стиль с чужого фото
         box = QGroupBox("Стиль с референса")
         sl = QVBoxLayout(box)
+        top = QHBoxLayout()
         self.style_combo = QComboBox()
+        self.style_combo.setIconSize(QSize(48, 32))
         self.style_combo.currentIndexChanged.connect(self.on_style)
-        sl.addWidget(self.style_combo)
+        top.addWidget(self.style_combo, 1)
+        self.style_menu_btn = QToolButton()
+        self.style_menu_btn.setText("⋯")
+        self.style_menu_btn.setToolTip("Переименовать или удалить стиль")
+        self.style_menu_btn.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self.style_menu_btn)
+        menu.addAction("Переименовать…", self.rename_style)
+        menu.addAction("Удалить…", self.delete_style)
+        self.style_menu_btn.setMenu(menu)
+        top.addWidget(self.style_menu_btn)
+        sl.addLayout(top)
         b = QPushButton("＋ Новый стиль из фото…")
         b.setToolTip("Выберите чужой снимок, цвета и настроение которого нравятся")
         b.clicked.connect(self.new_style)
         sl.addWidget(b)
-        self.rows["style_strength"] = SliderRow("style_strength", "Сила стиля", 0, 100)
-        self.rows["style_strength"].changed.connect(self.on_param)
-        sl.addWidget(self.rows["style_strength"])
+        self.style_mode = QComboBox()
+        self.style_mode.addItems(["Мягкий перенос", "Точный перенос"])
+        self.style_mode.setToolTip("Мягкий — переносит общий цвет и контраст референса.\n"
+                                   "Точный — повторяет распределение цветов и тонов референса целиком.")
+        self.style_mode.currentIndexChanged.connect(lambda i: self.on_param("style_mode", i))
+        sl.addWidget(self.style_mode)
+        for key, label, tip in (
+                ("style_strength", "Цвет стиля", "Сколько цвета брать у референса. 0 — только тон"),
+                ("style_tone", "Свет стиля", "Сколько света и контраста брать у референса. 0 — только цвет"),
+                ("style_skin", "Защита кожи", "Не перекрашивать тона кожи: лица остаются естественными")):
+            self.rows[key] = SliderRow(key, label, 0, 100)
+            self.rows[key].setToolTip(tip)
+            self.rows[key].changed.connect(self.on_param)
+            sl.addWidget(self.rows[key])
+        self.style2_combo = QComboBox()
+        self.style2_combo.setIconSize(QSize(48, 32))
+        self.style2_combo.setToolTip("Смешать с другим стилем: доля — ползунком ниже")
+        self.style2_combo.currentIndexChanged.connect(self.on_style2)
+        sl.addWidget(self.style2_combo)
+        self.rows["style_mix"] = SliderRow("style_mix", "Доля второго стиля", 0, 100)
+        self.rows["style_mix"].changed.connect(self.on_param)
+        sl.addWidget(self.rows["style_mix"])
         b = QPushButton("Сохранить как LUT (.cube)…")
-        b.setToolTip("Цвет и стиль в файле .cube для Lightroom, DaVinci или телефона")
+        b.setToolTip("Цвет, стиль и пресет в файле .cube для Lightroom, DaVinci или телефона.\n"
+                     "Можно сохранить и только стиль, без ваших ползунков")
         b.clicked.connect(self.export_lut)
         sl.addWidget(b)
         pl.addWidget(box)
@@ -790,7 +829,7 @@ class MainWindow(QMainWindow):
         self.view.set_source_size(*size)
         self.before = to_qimage(to_u8(img))
         saved = self.sidecar.get(path.name)
-        self.params = {**E.default_params(), **saved} if saved else E.default_params()
+        self.params = E.normalize_params(saved)
         if not saved and self.auto_on_open.isChecked():
             self.params.update(self.auto_for(path.name, img)[0])
         self.sync_controls()
@@ -823,10 +862,13 @@ class MainWindow(QMainWindow):
     def sync_controls(self):
         for key, row in self.rows.items():
             row.set_value(self.params.get(key, 0))
-        self.style_combo.blockSignals(True)
-        idx = self.style_combo.findText(self.params.get("style") or "— без стиля —")
-        self.style_combo.setCurrentIndex(max(0, idx))
-        self.style_combo.blockSignals(False)
+        for combo, key in ((self.style_combo, "style"), (self.style2_combo, "style2")):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData(self.params.get(key) or "")))
+            combo.blockSignals(False)
+        self.style_mode.blockSignals(True)
+        self.style_mode.setCurrentIndex(int(self.params.get("style_mode", 0)))
+        self.style_mode.blockSignals(False)
         self.look_combo.blockSignals(True)
         self.look_combo.setCurrentIndex(max(0, self.look_combo.findData(self.params.get("look") or "")))
         self.look_combo.blockSignals(False)
@@ -836,8 +878,15 @@ class MainWindow(QMainWindow):
         self.request_render()
 
     def current_style(self):
-        name = self.params.get("style")
-        return self.styles.get(name) if name else None
+        return self.style_for(self.params)
+
+    def style_for(self, p: dict) -> dict | None:
+        """Стиль кадра с учётом смеси со вторым стилем."""
+        a = self.styles.get(p.get("style") or "")
+        b = self.styles.get(p.get("style2") or "")
+        if a and b and b is not a and p.get("style_mix", 0):
+            return E.mix_styles(a, b, p["style_mix"] / 100)
+        return a
 
     def current_look(self):
         return self.looks.get(self.params.get("look") or "")
@@ -1033,22 +1082,38 @@ class MainWindow(QMainWindow):
     # ---------- стили
 
     def reload_styles(self, select: str | None = None):
-        self.styles = {}
+        self.styles, self.style_files = {}, {}
         for f in sorted(STYLES_DIR.glob("*.json")):
-            s = E.read_json(f, None)
-            if s and "mean" in s:
-                self.styles[s.get("name", f.stem)] = s
-        self.style_combo.blockSignals(True)
-        self.style_combo.clear()
-        self.style_combo.addItem("— без стиля —")
-        self.style_combo.addItems(list(self.styles))
+            st = E.read_json(f, None)
+            if st and "mean" in st:
+                name = st.get("name", f.stem)
+                self.styles[name], self.style_files[name] = st, f
+        for combo, empty in ((self.style_combo, "— без стиля —"), (self.style2_combo, "— смешать со стилем… —")):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(empty, "")
+            for name, f in self.style_files.items():
+                thumb = f.with_suffix(".jpg")
+                icon = QIcon(str(thumb)) if thumb.exists() else QIcon()
+                combo.addItem(icon, name, name)
+            combo.blockSignals(False)
         if select:
-            self.style_combo.setCurrentText(select)
-        self.style_combo.blockSignals(False)
+            self.style_combo.setCurrentIndex(max(0, self.style_combo.findData(select)))
+        self.style_menu_btn.setEnabled(bool(self.styles))
 
     def on_style(self, idx):
-        self.params["style"] = self.style_combo.currentText() if idx > 0 else ""
+        self.params["style"] = self.style_combo.itemData(idx) or ""
         self.request_render()
+
+    def on_style2(self, idx):
+        self.params["style2"] = self.style2_combo.itemData(idx) or ""
+        if self.params["style2"] and not self.params.get("style"):
+            self.toast("Сначала выберите основной стиль, затем второй для смеси")
+        self.request_render()
+
+    @staticmethod
+    def _safe(name: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in name).strip() or "стиль"
 
     def new_style(self):
         exts = " ".join(f"*{e}" for e in sorted(E.PHOTO_EXT))
@@ -1060,18 +1125,93 @@ class MainWindow(QMainWindow):
         name = name.strip()
         if not ok or not name:
             return
+        if name in self.styles and QMessageBox.question(
+                self, "Стиль уже есть", f"Стиль «{name}» уже есть. Заменить его?") != QMessageBox.Yes:
+            return
         self.toast("Анализирую цвета референса…", 0)
 
-        def done(style):
-            safe = "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in name)
-            E.write_json(STYLES_DIR / f"{safe}.json", style)
+        def done(res):
+            style, thumb = res
+            old = self.style_files.get(name)
+            dst = old or STYLES_DIR / f"{self._safe(name)}.json"
+            E.write_json(dst, style)
+            E.save_jpeg(dst.with_suffix(".jpg"), thumb / 255.0, 90)
             self.reload_styles(select=name)
             self.params["style"] = name
             self.request_render()
-            self.toast(f"Стиль «{name}» сохранён и применён. Силу регулирует ползунок ниже")
+            self.refresh_look_icons()
+            self.toast(f"Стиль «{name}» сохранён и применён. Цвет и свет стиля регулируются ползунками ниже")
 
-        run_task(E.style_from_image, path, name, done=done,
+        run_task(style_job, path, name, done=done,
                  fail=lambda m: self.toast(f"Не удалось прочитать референс: {m}", 8000))
+
+    def _replace_style_refs(self, old: str, new: str):
+        """Меняет имя стиля в правках текущего кадра и всех кадров открытой папки."""
+        for p in [self.params, *(v for k, v in self.sidecar.items() if k != SCENES_KEY)]:
+            for key in ("style", "style2"):
+                if p.get(key) == old:
+                    p[key] = new
+
+    def rename_style(self):
+        old = self.style_combo.itemData(self.style_combo.currentIndex()) or ""
+        if not old:
+            self.toast("Выберите в списке стиль, который нужно переименовать")
+            return
+        new, ok = QInputDialog.getText(self, "Переименовать стиль", "Новое название:", text=old)
+        new = new.strip()
+        if ok and new and new != old:
+            self._rename_style(old, new)
+
+    def _rename_style(self, old: str, new: str) -> bool:
+        src = self.style_files[old]
+        dst = STYLES_DIR / f"{self._safe(new)}.json"
+        if new in self.styles or (dst.exists() and dst != src):
+            self.toast(f"Стиль «{new}» уже есть — выберите другое название")
+            return False
+        try:
+            E.write_json(dst, {**self.styles[old], "name": new})
+            if src.with_suffix(".jpg").exists() and dst != src:
+                src.with_suffix(".jpg").replace(dst.with_suffix(".jpg"))
+            if dst != src:
+                src.unlink()
+        except OSError as e:
+            self.toast(f"Не удалось переименовать: {e}", 8000)
+            return False
+        self._replace_style_refs(old, new)
+        self.save_sidecar()
+        self.reload_styles()
+        self.sync_controls()
+        self.toast(f"Стиль «{old}» переименован в «{new}»")
+        return True
+
+    def delete_style(self):
+        name = self.style_combo.itemData(self.style_combo.currentIndex()) or ""
+        if not name:
+            self.toast("Выберите в списке стиль, который нужно удалить")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Удалить стиль")
+        box.setText(f"Удалить стиль «{name}»?\nКадры с этим стилем останутся без него. Фото-референс не удаляется.")
+        yes = box.addButton("✅ Удалить", QMessageBox.AcceptRole)
+        box.addButton("❌ Отмена", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is yes:
+            self._delete_style(name)
+
+    def _delete_style(self, name: str):
+        f = self.style_files[name]
+        try:
+            f.unlink()
+            f.with_suffix(".jpg").unlink(missing_ok=True)
+        except OSError as e:
+            self.toast(f"Не удалось удалить: {e}", 8000)
+            return
+        self._replace_style_refs(name, "")
+        self.save_sidecar()
+        self.reload_styles()
+        self.sync_controls()
+        self.request_render()
+        self.toast(f"Стиль «{name}» удалён")
 
     def export_lut(self):
         if self.base is None:
@@ -1081,10 +1221,25 @@ class MainWindow(QMainWindow):
                                               "3D LUT (*.cube)")
         if not path:
             return
-        no_style = {**self.params, "style": ""}
-        src = E.lab_stats(E.process(self.base, no_style, None, local=False))
-        E.export_cube(path, self.params, self.current_style(), src, look=self.current_look())
-        self.toast(f"LUT сохранён: {path}. Света/тени, чёткость и резкость в LUT не входят", 8000)
+        style_only = False
+        if self.current_style():
+            box = QMessageBox(self)
+            box.setWindowTitle("Что сохранить в LUT")
+            box.setText("Сохранить в LUT всё (ползунки, пресет и стиль) или только стиль референса?")
+            all_btn = box.addButton("Всё вместе", QMessageBox.AcceptRole)
+            box.addButton("Только стиль", QMessageBox.AcceptRole)
+            box.exec()
+            style_only = box.clickedButton() is not all_btn
+        if style_only:  # только перенос стиля: ползунки и пресет нейтральны
+            keys = ("style", "style2", "style_mix", "style_mode", "style_strength", "style_tone", "style_skin")
+            params = {**E.default_params(), **{k: self.params[k] for k in keys}}
+            look = None
+        else:
+            params, look = self.params, self.current_look()
+        src = E.lab_stats(E.process(self.base, {**params, "style": ""}, None, local=False))
+        E.export_cube(path, params, self.current_style(), src, look=look)
+        what = "только стиль" if style_only else "света/тени, чёткость и резкость в LUT не входят"
+        self.toast(f"LUT сохранён: {path} ({what})", 8000)
 
     # ---------- пресеты-образы
 
@@ -1138,7 +1293,7 @@ class MainWindow(QMainWindow):
         if idx <= 0 or self.base is None:
             return
         name = self.preset_combo.currentText()
-        self.params = {**E.default_params(), **E.read_json(PRESETS_DIR / f"{name}.json", {})}
+        self.params = E.normalize_params(E.read_json(PRESETS_DIR / f"{name}.json", {}))
         self.sync_controls()
         self.request_render()
         self.preset_combo.setCurrentIndex(0)
@@ -1176,11 +1331,11 @@ class MainWindow(QMainWindow):
         out_dir = Path(dlg.out.text())
         jobs = []
         for p in paths:
-            params = self.sidecar.get(p.name, self.params)
+            params = E.normalize_params(self.sidecar.get(p.name, self.params))
             sc = self.scene_for(p.name) if dlg.scene_look.isChecked() else None
             look = self.looks.get((sc or params).get("look") or "")
             jobs.append({"scene": sc, "src": str(p), "dst": str(out_dir / f"{p.stem}.jpg"), "params": params,
-                         "style": self.styles.get(params.get("style") or ""),
+                         "style": self.style_for(params),
                          "look": look,
                          "auto": dlg.auto.isChecked(), "long_edge": dlg.edge.value(),
                          "quality": dlg.quality.value()})

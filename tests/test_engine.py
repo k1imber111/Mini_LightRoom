@@ -38,6 +38,45 @@ assert half.shape == (200, 200, 3)
 ramp = np.linspace(0, 1, 256, dtype=np.float32)[None, :, None].repeat(3, 2)
 assert (np.diff(E.process(ramp, {**E.default_params(), "contrast": 200})[0, :, 0]) >= -1e-6).all()
 
+# Стили (этап 2): раздельные силы, точный режим, смесь, защита кожи, потолок сдвига.
+import cv2  # noqa: E402
+
+to_lab = lambda x: cv2.cvtColor(np.clip(x, 0, 1).astype(np.float32), cv2.COLOR_RGB2Lab)
+warm = np.clip(img * np.array([1.3, 1.0, 0.6], np.float32) + 0.1, 0, 1)   # «референс»: тёплый и светлый
+ref = {"name": "ref", **E.lab_stats(warm)}
+base_lab = to_lab(img)
+full_p = {**E.default_params(), "style_strength": 100, "style_tone": 100, "style_skin": 0}
+for mode in (0, 1):
+    got = to_lab(E.process(img, {**full_p, "style_mode": mode}, ref))
+    before = np.abs(base_lab.mean((0, 1)) - np.array(ref["mean"])).sum()
+    after = np.abs(got.mean((0, 1)) - np.array(ref["mean"])).sum()
+    print(f"стиль, режим {mode}: расстояние до референса {before:.1f} → {after:.1f}")
+    assert after < before * 0.5, "перенос не приблизил кадр к референсу"
+only_color = to_lab(E.process(img, {**full_p, "style_tone": 0}, ref))
+dl = np.abs(only_color[..., 0] - base_lab[..., 0])  # у краёв охвата RGB обрезка чуть трогает яркость
+assert dl.mean() < 0.3 and np.percentile(dl, 99) < 1.5, "«только цвет» изменил яркость"
+only_tone = to_lab(E.process(img, {**full_p, "style_strength": 0}, ref))
+assert np.abs(only_tone[..., 1:] - base_lab[..., 1:]).mean() < 1.0, "«только тон» изменил цвет"
+far = {"name": "far", "mean": [50, 90, -90], "std": [20, 5, 5]}   # нереально кислотный референс
+shift = to_lab(E.process(img, full_p, far))[..., 1:] - base_lab[..., 1:]
+assert np.abs(shift).mean() < 31, "сдвиг цвета не ограничен"  # просили ~90, потолок 30
+assert E.mix_styles(ref, far, 0.0)["mean"] == ref["mean"] and E.mix_styles(ref, far, 1.0)["mean"] == far["mean"]
+skin = np.full((50, 50, 3), [0.85, 0.62, 0.5], np.float32)          # тон кожи
+cool = {"name": "cool", **E.lab_stats(np.full((50, 50, 3), [0.3, 0.5, 0.9], np.float32))}
+d_skin = lambda k: np.abs(to_lab(E.process(skin, {**full_p, "style_skin": k}, cool, E.lab_stats(img)))
+                          - to_lab(skin))[..., 1:].mean()
+print(f"кожа: сдвиг без защиты {d_skin(0):.1f}, с защитой {d_skin(100):.1f}")
+assert d_skin(100) < d_skin(0) * 0.3, "защита кожи не работает"
+assert E.normalize_params({"style_strength": 56})["style_tone"] == 56, "старые правки меняют вид"
+# Почти однородное небо в точном режиме не растягивается до всего диапазона референса (иначе — ореолы).
+sky = np.clip(0.45 + 0.02 * np.linspace(-1, 1, 300, dtype=np.float32)[None, :, None] * np.ones((200, 1, 3)), 0, 1)
+sky_out = to_lab(E.process(sky.astype(np.float32), {**full_p, "style_mode": 1}, ref))
+k = sky_out[..., 0].std() / to_lab(sky)[..., 0].std()
+print(f"небо в точном режиме: контраст ×{k:.2f}")
+assert k <= 2.05, "точный перенос раздувает контраст однородного неба"
+with tempfile.TemporaryDirectory() as d:
+    E.export_cube(Path(d) / "s.cube", {**full_p, "style_mode": 1}, ref, E.lab_stats(img))
+
 # Пресеты-образы: все встроенные рабочие, сила 0 — без изменений, 50% — ровно середина.
 looks = E.load_looks(Path(__file__).resolve().parent.parent / "looks")
 assert 20 <= len(looks) <= 30, len(looks)

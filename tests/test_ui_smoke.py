@@ -31,6 +31,8 @@ if __name__ == "__main__":
     apply_dark_theme(app)
     import mini_lightroom.ui as ui
     ui.PREVIEW_SIDE = 400  # превью меньше кадра, чтобы проверить просмотр в масштабе
+    styles_tmp = tempfile.TemporaryDirectory(prefix="стили_")
+    ui.STYLES_DIR = Path(styles_tmp.name)  # не трогаем настоящую библиотеку стилей
     with tempfile.TemporaryDirectory(prefix="съёмка_") as d:
         d = Path(d)
         rng = np.random.default_rng(1)
@@ -60,6 +62,28 @@ if __name__ == "__main__":
         win.styles["тест"] = style
         win.params["style"] = "тест"
         win.request_render()
+        wait(app, lambda: not win.rendering and not win.dirty)
+
+        # библиотека стилей (этап 2): миниатюра, режим, смесь, переименование, удаление
+        for i, nm in ((1, "Тёплый"), (2, "Холодный")):
+            st, th = ui.style_job(d / f"кадр_{i}.jpg", nm)
+            E.write_json(ui.STYLES_DIR / f"{nm}.json", st)
+            E.save_jpeg(ui.STYLES_DIR / f"{nm}.jpg", th / 255.0)
+        win.reload_styles()
+        assert not win.style_combo.itemIcon(win.style_combo.findData("Тёплый")).isNull(), "нет миниатюры стиля"
+        win.style_combo.setCurrentIndex(win.style_combo.findData("Тёплый"))
+        win.style2_combo.setCurrentIndex(win.style2_combo.findData("Холодный"))
+        win.style_mode.setCurrentIndex(1)
+        wait(app, lambda: not win.rendering and not win.dirty)
+        assert win.params["style_mode"] == 1 and "+" in win.current_style()["name"], "смесь стилей не собралась"
+        assert win._rename_style("Тёплый", "Персик")
+        assert win.params["style"] == "Персик" and (ui.STYLES_DIR / "Персик.jpg").exists()
+        assert not (ui.STYLES_DIR / "Тёплый.json").exists()
+        assert not win._rename_style("Персик", "Холодный"), "переименование затёрло чужой стиль"
+        win._delete_style("Холодный")
+        assert win.params["style2"] == "" and not (ui.STYLES_DIR / "Холодный.json").exists()
+        win.sync_controls()
+        assert win.style_combo.currentText() == "Персик"
         wait(app, lambda: not win.rendering and not win.dirty)
 
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
