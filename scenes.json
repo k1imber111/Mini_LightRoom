@@ -1,12 +1,18 @@
 [
   {"id": "sunset", "name": "Закат / рассвет", "icon": "🌅",
-   "prompts": ["a photo of a sunset", "a photo of a sunrise", "golden hour sky with the sun low on the horizon",
-               "orange and pink clouds at dusk"],
+   "prompts": ["a photo of a sunset",
+               "a photo of a sunrise",
+               "an orange sky at sunset",
+               "warm golden evening light over water",
+               "golden hour with a warm glowing sky",
+               "orange and pink clouds at sunset"],
    "look": "Персиковый закат", "look_strength": 85,
    "params": {"highlights": -20, "vibrance": 10}},
 
   {"id": "blue_hour", "name": "Сумерки", "icon": "🌆",
-   "prompts": ["a photo taken at blue hour", "twilight sky over a city", "a calm evening at dusk with deep blue sky"],
+   "prompts": ["a photo taken at blue hour with a deep blue sky",
+               "a dark blue twilight sky after sunset",
+               "a city at dusk under a blue sky with lights turning on"],
    "look": "Лавандовые сумерки", "look_strength": 80,
    "params": {"shadows": 20, "highlights": -15}},
 
@@ -16,8 +22,12 @@
    "params": {"shadows": 25, "highlights": -30, "clarity": 5}},
 
   {"id": "portrait", "name": "Портрет", "icon": "🙂",
-   "prompts": ["a portrait photo of a person", "a close-up photo of a face", "a photo of a smiling woman",
-               "a photo of a man looking at the camera"],
+   "prompts": ["a portrait photo of a person",
+               "a close-up photo of a face",
+               "a photo of a smiling woman",
+               "a photo of a man looking at the camera",
+               "a woman posing outdoors",
+               "a photo of a person in the foreground"],
    "look": "Мягкий портрет", "look_strength": 80,
    "params": {"clarity": -10, "sharpness": 20}},
 

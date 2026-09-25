@@ -7,7 +7,14 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 echo Ставлю библиотеки ИИ для распознавания сцен: PyTorch с CUDA, около 3 ГБ, один раз...
-".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements-ai.txt
+".venv\Scripts\python.exe" -m pip install --disable-pip-version-check --retries 5 --timeout 60 torch torchvision --index-url https://download.pytorch.org/whl/cu128 || goto fail
+".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements-ai.txt || goto fail
 echo.
 echo Готово. Перезапустите Mini LightRoom и нажмите кнопку «Сцены».
 pause
+exit /b 0
+:fail
+echo.
+echo Установка не удалась. Проверьте интернет и запустите install_ai.bat ещё раз.
+pause
+exit /b 1

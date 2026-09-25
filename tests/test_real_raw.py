@@ -11,6 +11,8 @@ src = Path(sys.argv[1])
 t = time.perf_counter()
 th = E.load_thumb(src)
 print(f"миниатюра {th.shape} за {time.perf_counter() - t:.2f} с, резкость {E.sharpness(th):.0f}")
+fw, fh = E.full_size(src)
+assert (th.shape[1] > th.shape[0]) == (fw > fh), "миниатюра повёрнута не так, как кадр (двойной поворот?)"
 t = time.perf_counter()
 prev = E.load_image(src, half=True, max_side=1400)
 print(f"превью {prev.shape} за {time.perf_counter() - t:.2f} с")

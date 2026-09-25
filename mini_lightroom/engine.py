@@ -100,7 +100,9 @@ def load_thumb(path, size: int = 512) -> np.ndarray:
             try:
                 th = raw.extract_thumb()
                 if th.format == rawpy.ThumbFormat.JPEG:
-                    bgr = cv2.imdecode(np.frombuffer(th.data, np.uint8), cv2.IMREAD_COLOR)
+                    # EXIF встроенного JPEG не учитываем: поворот задаёт flip из RAW, иначе кадр повернётся дважды.
+                    bgr = cv2.imdecode(np.frombuffer(th.data, np.uint8),
+                                       cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 else:
                     rgb = np.asarray(th.data)

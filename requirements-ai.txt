@@ -1,6 +1,4 @@
 # Необязательные библиотеки ИИ (этап 1: распознавание сцен). Ставит install_ai.bat.
-# PyTorch со сборкой под CUDA 12.8 (видеокарты NVIDIA RTX); без видеокарты работает медленнее на процессоре.
---extra-index-url https://download.pytorch.org/whl/cu128
-torch
-torchvision
+# PyTorch ставится ДО этого файла отдельной командой с --index-url https://download.pytorch.org/whl/cu128:
+# в одном файле pip предпочтёт более новую CPU-сборку с PyPI, и видеокарта не будет задействована.
 open_clip_torch

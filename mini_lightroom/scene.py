@@ -6,11 +6,14 @@ torch и open_clip тяжёлые и необязательные (requirements-
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import numpy as np
 
 __all__ = ["SceneClassifier", "available"]
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # Windows без прав на симлинки — не шуметь
 
 MODEL, PRETRAINED = "ViT-B-32", "laion2b_s34b_b79k"
 
