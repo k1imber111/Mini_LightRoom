@@ -86,6 +86,58 @@ if __name__ == "__main__":
         assert win.style_combo.currentText() == "Персик"
         wait(app, lambda: not win.rendering and not win.dirty)
 
+        # маски (этап 3): жесты мышью на кадре, ползунки маски, ИИ-маска из готового PNG
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        v = win.view
+        win.view.set_zoom(None)
+        app.processEvents()
+        at = lambda xn, yn: v.to_widget_pt(xn, yn).toPoint()
+
+        def drag(p0, p1, mod=Qt.NoModifier):
+            QTest.mousePress(v, Qt.LeftButton, mod, p0)
+            for k in range(1, 6):
+                QTest.mouseMove(v, p0 + (p1 - p0) * k / 5)
+            QTest.mouseRelease(v, Qt.LeftButton, mod, p1)
+
+        win.add_mask("linear")
+        drag(at(0.5, 0.05), at(0.5, 0.5))
+        lin = win.masks()[-1]
+        assert lin["type"] == "linear" and lin["b"][1] > 0.4, lin
+        win.mask_rows["exposure"].slider.setValue(-150)
+        assert lin["adj"]["exposure"] == -150
+        win.add_mask("radial")
+        drag(at(0.5, 0.6), at(0.7, 0.8))
+        rad = win.masks()[-1]
+        assert rad["type"] == "radial" and rad["r"][0] > 0.1, rad
+        win.mask_rows["temperature"].slider.setValue(50)
+        win.add_mask("brush")
+        drag(at(0.1, 0.9), at(0.4, 0.9))
+        drag(at(0.2, 0.9), at(0.3, 0.9), Qt.AltModifier)
+        br = win.masks()[-1]
+        assert len(br["strokes"]) == 2 and br["strokes"][1]["erase"], "кисть/ластик не записались"
+        win.mask_rows["saturation"].slider.setValue(-80)
+        # ИИ-маска: кладём готовый PNG, как будто модель уже посчитала небо
+        sky = np.zeros((win.base.shape[0], win.base.shape[1]), np.uint8)
+        sky[: sky.shape[0] // 3] = 255
+        ui._write_png(d / ui.MASKS_DIR / f"{win.current.name}.sky.png", sky)
+        win.add_ai_mask("sky")
+        assert win.masks()[-1]["type"] == "ai" and win.render_params()["masks"][-1]["arr"] is not None
+        win.mask_rows["exposure"].slider.setValue(80)
+        win.mask_show.setChecked(True)
+        v.repaint()
+        assert win.editor._overlay is not None, "подсветка маски не построилась"
+        win.mask_show.setChecked(False)
+        wait(app, lambda: not win.rendering and not win.dirty)
+        assert len(win.masks()) == 4 and "arr" not in win.masks()[-1], "массив маски попал в правки"
+        win.copy_settings()
+        win.clipboard["masks"][0]["adj"]["exposure"] = 0
+        assert lin["adj"]["exposure"] == -150, "копия правок делит маски с оригиналом"
+        win.save_sidecar()
+        saved = E.read_json(d / ".mini_lightroom.json", {})[win.current.name]["masks"]
+        assert [m["type"] for m in saved] == ["linear", "radial", "brush", "ai"]
+        win.mask_list.setCurrentRow(-1)
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))

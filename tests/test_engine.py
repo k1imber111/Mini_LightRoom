@@ -77,6 +77,37 @@ assert k <= 2.05, "точный перенос раздувает контрас
 with tempfile.TemporaryDirectory() as d:
     E.export_cube(Path(d) / "s.cube", {**full_p, "style_mode": 1}, ref, E.lab_stats(img))
 
+# Маски (этап 3): геометрия в долях кадра, одинаковая в превью, вырезке и полном размере.
+from mini_lightroom import masks as MK  # noqa: E402
+
+lin = MK.layer_mask(MK.new_layer("linear", a=[0.5, 0.0], b=[0.5, 0.5]), 100, 150)
+assert lin[2, 75] > 0.99 and lin[60, 75] < 0.01, "линейный градиент: сила от a к b"
+rad = MK.new_layer("radial", c=[0.5, 0.5], r=[0.2, 0.2], feather=30)
+m = MK.layer_mask(rad, 100, 150)
+assert m[50, 75] > 0.99 and m[5, 5] < 0.01 and MK.layer_mask({**rad, "invert": True}, 100, 150)[5, 5] > 0.99
+br = MK.new_layer("brush", feather=0, strokes=[{"pts": [[0.1, 0.5], [0.9, 0.5]], "r": 0.05, "erase": False},
+                                               {"pts": [[0.5, 0.5]], "r": 0.08, "erase": True}])
+m = MK.layer_mask(br, 100, 150)
+assert m[50, 30] > 0.9 and m[50, 75] < 0.1 and m[10, 30] < 0.01, "кисть: мазок и ластик"
+ai = MK.new_layer("ai", cat="sky", arr=(np.arange(300)[None, :] > 150).repeat(200, 0).astype(np.uint8) * 255)
+assert MK.layer_mask(ai, 100, 150)[50, 10] < 0.01 and MK.layer_mask(ai, 100, 150)[50, 140] > 0.99
+layers = [{**MK.new_layer("linear", a=[0.5, 0], b=[0.5, 0.6]), "adj": {"exposure": -150, "saturation": 40}},
+          {**rad, "adj": {"exposure": 120, "clarity": 50}},
+          {**br, "feather": 60, "adj": {"temperature": 60, "sharpness": 50}},
+          {**ai, "adj": {"tint": 40}}]
+pm = {**E.default_params(), "masks": layers}
+out_m = E.process(img, pm)
+assert out_m[:100].mean() < img[:100].mean() - 0.05, "маска неба не затемнила верх"
+full_m = E.process(img, pm)
+_, part_m = E.process_region(img, (600, 300, 1000, 700), 1.0, pm)
+dm = np.abs(part_m - full_m[300:700, 600:1000]).mean()
+print(f"маски: вырезка против целого кадра {dm:.4f}")
+assert dm < 0.01, "маски в увеличенной вырезке расходятся с превью"
+assert np.abs(E.process(img, {**pm, "masks": [{**layers[0], "on": False}]}) - E.process(img, E.default_params())).max() < 1e-5
+t = time.perf_counter()
+E.process(img, pm)
+print(f"обработка с 4 масками: {(time.perf_counter() - t) * 1000:.0f} мс")
+
 # Пресеты-образы: все встроенные рабочие, сила 0 — без изменений, 50% — ровно середина.
 looks = E.load_looks(Path(__file__).resolve().parent.parent / "looks")
 assert 20 <= len(looks) <= 30, len(looks)

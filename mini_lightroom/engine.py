@@ -14,6 +14,8 @@ import cv2
 import numpy as np
 import rawpy
 
+from . import masks as M
+
 RAW_EXT = {".arw", ".srf", ".sr2", ".cr2", ".cr3", ".nef", ".dng", ".raf", ".orf", ".rw2", ".pef"}
 IMG_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 PHOTO_EXT = RAW_EXT | IMG_EXT
@@ -42,7 +44,7 @@ def default_params() -> dict:
     # style_mode: 0 — мягкий перенос (среднее и разброс), 1 — точный (распределения L/a/b),
     # style2/style_mix — второй стиль и его доля в смеси.
     p.update(style="", style_strength=70, style_tone=70, style_skin=60, style_mode=0, style2="", style_mix=50,
-             look="", look_strength=100)
+             look="", look_strength=100, masks=[])
     return p
 
 
@@ -358,11 +360,11 @@ def process(img: np.ndarray, p: dict, style: dict | None = None,
     h, w = img.shape[:2]
     fw, fh, x0, y0 = frame or (w, h, 0, 0)
 
-    # Баланс белого и экспозиция в линейном свете.
-    lin = img ** 2.2
+    # Баланс белого и экспозиция в линейном свете: (x^2.2 · k)^(1/2.2) = x · k^(1/2.2), без возведения пикселей.
     t, m = g("temperature"), g("tint")
-    lin *= np.array([1 + 0.25 * t, 1 - 0.2 * m, 1 - 0.25 * t], np.float32) * np.float32(2 ** g("exposure"))
-    img = lin ** (1 / 2.2)
+    if t or m or g("exposure"):
+        gain = np.array([1 + 0.25 * t, 1 - 0.2 * m, 1 - 0.25 * t], np.float32) * np.float32(2 ** g("exposure"))
+        img *= np.maximum(gain, 0) ** (1 / 2.2)
 
     # Света и тени: маска по сглаженной яркости, чтобы не терять локальный контраст.
     sh, hl = g("shadows"), g("highlights")
@@ -404,6 +406,9 @@ def process(img: np.ndarray, p: dict, style: dict | None = None,
     if look:  # образ — финальный цвет, поверх стиля; виньетка и резкость уже после него
         img = apply_look(img, look, p.get("look_strength", 100) / 100.0)
 
+    if local and p.get("masks"):  # маски пространственные: в LUT не попадают
+        img = apply_masks(np.clip(img, 0, 1), p["masks"], (fw, fh, x0, y0))
+
     if local:
         v = g("vignette")
         if v:
@@ -418,6 +423,21 @@ def process(img: np.ndarray, p: dict, style: dict | None = None,
             img += 1.2 * s * (img - blur)
 
     return np.clip(img, 0, 1).astype(np.float32)
+
+
+def apply_masks(img: np.ndarray, layers: list, frame: tuple) -> np.ndarray:
+    """Локальные правки: для каждого слоя — тот же process с ползунками слоя, смешанный по маске."""
+    h, w = img.shape[:2]
+    for layer in layers:
+        adj = {k: v for k, v in layer.get("adj", {}).items() if v}
+        if not layer.get("on", True) or not adj:
+            continue
+        m = M.layer_mask(layer, h, w, frame)
+        if m is None or m.max() < 1e-3:
+            continue
+        local = process(img, {**default_params(), **adj}, frame=frame)
+        img = img + (local - img) * m[..., None]
+    return img
 
 
 def style_source_stats(img: np.ndarray, p: dict) -> dict:

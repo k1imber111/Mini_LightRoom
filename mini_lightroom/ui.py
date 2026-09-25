@@ -1,11 +1,13 @@
 """Окно Mini LightRoom (PySide6)."""
 from __future__ import annotations
 
+import copy
 import os
 import statistics
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PySide6.QtCore import (
     QObject,
@@ -65,7 +67,10 @@ from PySide6.QtWidgets import (
 )
 
 from . import engine as E
+from . import masks as MK
 from . import scene as S
+from . import segment as G
+from .mask_editor import MaskEditor
 
 APP_DIR = Path(__file__).resolve().parent.parent
 STYLES_DIR = APP_DIR / "styles"
@@ -75,6 +80,7 @@ MODELS_DIR = APP_DIR / "models"
 SCENES_KEY = "__scenes__"   # в sidecar: {имя файла: [id сцены, уверенность]}
 PRESETS_DIR = APP_DIR / "presets"
 SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат рядом со снимками
+MASKS_DIR = ".mini_lightroom_masks"  # ИИ-маски кадров (PNG) рядом со снимками
 PREVIEW_SIDE = 1400
 PATH_ROLE = Qt.UserRole
 ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 7, 10, 16]  # 1 = 100% (пиксель снимка = пиксель экрана)
@@ -153,6 +159,34 @@ def style_job(path, name):
     return {"name": name, **E.lab_stats(img)}, to_u8(E.resize_max(img, 96))
 
 
+def _seg_input(base):
+    """Кадр для сегментации: с авто-тоном, чтобы тёмный RAW не путал модель."""
+    return E.process(base, E.normalize_params(E.auto_params(base)))
+
+
+def segment_job(segmenter, path, base, cats, create):
+    if segmenter is None:  # первый раз: загрузка модели (и скачивание весов)
+        segmenter = G.Segmenter(MODELS_DIR)
+    maps = segmenter.masks(_seg_input(base), cats)
+    return segmenter, path, {c: (m * 255 + 0.5).astype(np.uint8) for c, m in maps.items()}, create
+
+
+def prepare_ai_job(segmenter, items, out_dir):
+    """ИИ-маски для кадров, которые ещё не открывали (перед экспортом)."""
+    if segmenter is None:
+        segmenter = G.Segmenter(MODELS_DIR)
+    for path, cats in items:
+        base = E.load_image(path, half=True, max_side=PREVIEW_SIDE)
+        for cat, m in segmenter.masks(_seg_input(base), cats).items():
+            _write_png(Path(out_dir) / f"{Path(path).name}.{cat}.png", (m * 255 + 0.5).astype(np.uint8))
+    return segmenter
+
+
+def _write_png(path: Path, arr: np.ndarray):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(cv2.imencode(".png", arr)[1].tobytes())  # через Python: кириллица в пути
+
+
 def full_job(path):
     return path, E.load_image(path, half=False)
 
@@ -187,6 +221,7 @@ class ImageView(QWidget):
         self._drag = None
         self.message = "Откройте папку со снимками\nCtrl+O или кнопка «Открыть папку»"
         self.badge = ""
+        self.editor = None  # MaskEditor: забирает левую кнопку, когда выбрана маска
         self.setMinimumSize(400, 300)
         self.setMouseTracking(True)
 
@@ -225,6 +260,17 @@ class ImageView(QWidget):
         return QRectF(self.width() / 2 + (r.x() - self.cx) * s, self.height() / 2 + (r.y() - self.cy) * s,
                       r.width() * s, r.height() * s)
 
+    def to_norm(self, pos: QPointF) -> tuple[float, float]:
+        """Точка виджета → доли полного кадра."""
+        s = self.scale()
+        return ((self.cx + (pos.x() - self.width() / 2) / s) / self.src_w,
+                (self.cy + (pos.y() - self.height() / 2) / s) / self.src_h)
+
+    def to_widget_pt(self, xn: float, yn: float) -> QPointF:
+        s = self.scale()
+        return QPointF(self.width() / 2 + (xn * self.src_w - self.cx) * s,
+                       self.height() / 2 + (yn * self.src_h - self.cy) * s)
+
     def visible_rect(self) -> QRectF:
         """Видимая часть кадра в его пикселях."""
         s = self.scale()
@@ -261,14 +307,21 @@ class ImageView(QWidget):
         if self.pix and e.angleDelta().y():
             self.step_zoom(1 if e.angleDelta().y() > 0 else -1, e.position())
 
+    def _editing(self) -> bool:
+        return self.editor is not None and self.editor.active()
+
     def mouseDoubleClickEvent(self, e):
-        if self.pix:
+        if self.pix and not self._editing():  # при рисовании двойной щелчок не прыгает масштабом
             self.set_zoom(None if self.zoom else 1.0, e.position())
 
     def mousePressEvent(self, e):
-        if self.zoom and e.button() == Qt.LeftButton:
+        # Правая и средняя кнопки всегда двигают кадр; левая — если не занята маской.
+        pan = e.button() in (Qt.RightButton, Qt.MiddleButton) or (e.button() == Qt.LeftButton and not self._editing())
+        if pan and self.zoom:
             self._drag = (e.position(), self.cx, self.cy)
             self.setCursor(Qt.ClosedHandCursor)
+        elif self.editor is not None and self.editor.press(e, self):
+            self.update()
 
     def mouseMoveEvent(self, e):
         if self._drag:
@@ -277,6 +330,11 @@ class ImageView(QWidget):
             self.cx, self.cy = cx - (e.position().x() - p0.x()) / s, cy - (e.position().y() - p0.y()) / s
             self._clamp()
             self.update()
+            return
+        if self.editor is not None and self.editor.move(e, self):
+            self.update()
+        if self._editing():
+            self.setCursor(Qt.CrossCursor)
         else:
             self.setCursor(Qt.OpenHandCursor if self.zoom else Qt.ArrowCursor)
 
@@ -285,6 +343,14 @@ class ImageView(QWidget):
             self._drag = None
             self.setCursor(Qt.OpenHandCursor)
             self.view_changed.emit()
+        elif self.editor is not None and self.editor.release(e, self):
+            self.update()
+
+    def leaveEvent(self, e):
+        if self.editor is not None:
+            self.editor._hover = None
+            self.update()
+        super().leaveEvent(e)
 
     def resizeEvent(self, e):
         self._clamp()
@@ -306,6 +372,8 @@ class ImageView(QWidget):
                 # От 200% показываем пиксели как есть, без сглаживания: так видна реальная резкость.
                 p.setRenderHint(QPainter.SmoothPixmapTransform, self.scale() * rect.width() < dpix.width() * 2)
                 p.drawPixmap(self.to_widget(rect), dpix, QRectF(dpix.rect()))
+            if self.editor is not None:
+                self.editor.paint(p, self)
         if self.badge:
             p.setPen(QColor("#ffffff"))
             r = p.fontMetrics().boundingRect(self.badge).adjusted(-8, -4, 8, 4)
@@ -383,7 +451,7 @@ class SliderRow(QWidget):
     def _show(self, v):
         if self.key == "exposure":
             self.value.setText(f"{v / 100:+.2f} EV")
-        elif self.key == "sharpness" or self.key.startswith(("style_", "look_")):
+        elif self.key in ("sharpness", "brush_size", "mask_feather") or self.key.startswith(("style_", "look_")):
             self.value.setText(f"{v}")
         else:
             self.value.setText(f"{v:+d}" if v else "0")
@@ -522,6 +590,11 @@ class MainWindow(QMainWindow):
         self.scene_by_id = {sc["id"]: sc for sc in self.scene_defs}
         self.scene_of: dict[str, list] = {}
         self.classifier = None
+        self.segmenter = None
+        self.ai_cache: dict[tuple[str, str], np.ndarray] = {}
+        self.editor = MaskEditor(self.ai_arr_for_layer)
+        self.editor.changed.connect(self.on_mask_geom)
+        self.editor.created.connect(self.on_mask_created)
         self.thumb_pool = QThreadPool()
         self.thumb_pool.setMaxThreadCount(2)
         STYLES_DIR.mkdir(exist_ok=True)
@@ -581,6 +654,7 @@ class MainWindow(QMainWindow):
         self.a_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
         self.a_fit = self._action("Вписать", lambda: self.view.set_zoom(None), "Ctrl+0")
         self.a_100 = self._action("100%", lambda: self.view.set_zoom(1.0), "Ctrl+1")
+        self._action("Показать маску", lambda: self.mask_show.toggle(), "O")
         self.zoom_combo = QComboBox()
         self.zoom_combo.addItem("Вписать")
         self.zoom_combo.addItems([f"{round(z * 100)}%" for z in ZOOM_STEPS])
@@ -607,6 +681,7 @@ class MainWindow(QMainWindow):
 
         self.view = ImageView()
         self.view.view_changed.connect(self.on_view_changed)
+        self.view.editor = self.editor
 
         panel = QWidget()
         pl = QVBoxLayout(panel)
@@ -623,6 +698,71 @@ class MainWindow(QMainWindow):
             row.changed.connect(self.on_param)
             groups[group].addWidget(row)
             self.rows[key] = row
+
+        # Маски: локальные правки
+        box = QGroupBox("Маски")
+        ml = QVBoxLayout(box)
+        row = QHBoxLayout()
+        for text, kind, tip in (
+                ("🖌 Кисть", "brush", "Рисуйте по кадру, где нужна правка. Alt — стереть"),
+                ("▤ Линейный", "linear", "Протяните по кадру: сила от начала линии до нуля в конце"),
+                ("◎ Радиальный", "radial", "Протяните от центра: овал, внутри — правка")):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, k=kind: self.add_mask(k))
+            row.addWidget(b)
+        ai_btn = QToolButton()
+        ai_btn.setText("✨ ИИ")
+        ai_btn.setToolTip("Маска по содержимому кадра: небо, люди, зелень, вода, здания (локально на видеокарте)")
+        ai_btn.setPopupMode(QToolButton.InstantPopup)
+        ai_menu = QMenu(ai_btn)
+        for cat, (label, _) in G.CATEGORIES.items():
+            ai_menu.addAction(label, lambda c=cat: self.add_ai_mask(c))
+        ai_btn.setMenu(ai_menu)
+        row.addWidget(ai_btn)
+        ml.addLayout(row)
+        self.mask_list = QListWidget()
+        self.mask_list.setMaximumHeight(96)
+        self.mask_list.setToolTip("Галочка — включить/выключить, двойной щелчок — переименовать")
+        self.mask_list.currentRowChanged.connect(self.on_mask_select)
+        self.mask_list.itemChanged.connect(self.on_mask_item)
+        ml.addWidget(self.mask_list)
+        self.mask_box = QWidget()
+        mb = QVBoxLayout(self.mask_box)
+        mb.setContentsMargins(0, 0, 0, 0)
+        opts = QHBoxLayout()
+        self.mask_invert = QCheckBox("Инверсия")
+        self.mask_invert.toggled.connect(self.on_mask_invert)
+        self.mask_show = QCheckBox("Показать (O)")
+        self.mask_show.setToolTip("Подсветить маску красным")
+        self.mask_show.toggled.connect(self.on_mask_show)
+        del_btn = QPushButton("Удалить")
+        del_btn.clicked.connect(self.delete_mask)
+        for w in (self.mask_invert, self.mask_show):
+            opts.addWidget(w)
+        opts.addStretch()
+        opts.addWidget(del_btn)
+        mb.addLayout(opts)
+        self.brush_size_row = SliderRow("brush_size", "Размер кисти", 2, 200)
+        self.brush_size_row.set_value(self.editor.brush_size)
+        self.brush_size_row.changed.connect(lambda _k, v: setattr(self.editor, "brush_size", v))
+        self.brush_erase = QCheckBox("Стирать (или удерживайте Alt)")
+        self.brush_erase.toggled.connect(lambda on: setattr(self.editor, "erase", on))
+        self.mask_feather_row = SliderRow("mask_feather", "Растушёвка", 0, 100)
+        self.mask_feather_row.changed.connect(self.on_mask_feather)
+        for w in (self.brush_size_row, self.brush_erase, self.mask_feather_row):
+            mb.addWidget(w)
+        limits = {key: (label, lo, hi) for key, label, lo, hi, _ in E.SLIDERS}
+        self.mask_rows: dict[str, SliderRow] = {}
+        for key in MK.LOCAL_KEYS:
+            label, lo, hi = limits[key]
+            r = SliderRow(key, label, lo, hi)
+            r.changed.connect(self.on_mask_adj)
+            mb.addWidget(r)
+            self.mask_rows[key] = r
+        ml.addWidget(self.mask_box)
+        self.mask_box.hide()
+        pl.addWidget(box)
 
         # Готовые пресеты-образы с силой
         box = QGroupBox("Пресеты")
@@ -837,6 +977,7 @@ class MainWindow(QMainWindow):
         self.view.message = ""
         self.request_render()
         self.refresh_look_icons()
+        self.ensure_ai_masks()
 
     def on_error(self, msg):
         self.view.message = f"Не получилось открыть кадр:\n{msg}"
@@ -862,6 +1003,7 @@ class MainWindow(QMainWindow):
     def sync_controls(self):
         for key, row in self.rows.items():
             row.set_value(self.params.get(key, 0))
+        self.refresh_mask_list()
         for combo, key in ((self.style_combo, "style"), (self.style2_combo, "style2")):
             combo.blockSignals(True)
             combo.setCurrentIndex(max(0, combo.findData(self.params.get(key) or "")))
@@ -901,7 +1043,7 @@ class MainWindow(QMainWindow):
             return
         self.rendering = True
         self.gen += 1
-        run_task(render_job, self.gen, self.base, dict(self.params), self.current_style(), self.current_look(),
+        run_task(render_job, self.gen, self.base, self.render_params(), self.current_style(), self.current_look(),
                  done=self.on_rendered, fail=self.on_render_fail)
 
     def on_rendered(self, res):
@@ -960,7 +1102,7 @@ class MainWindow(QMainWindow):
             return
         self.detail_busy = True
         run_task(detail_job, self.detail_gen, self.full, self.base, rect, min(1.0, v.scale()),
-                 dict(self.params), self.current_style(), self.current_look(), done=self.on_detail, fail=self.on_detail_fail)
+                 self.render_params(), self.current_style(), self.current_look(), done=self.on_detail, fail=self.on_detail_fail)
 
     def on_full(self, res):
         path, img = res
@@ -1007,6 +1149,188 @@ class MainWindow(QMainWindow):
         self.sync_controls()
         self.request_render()
         self.toast(msg)
+
+    # ---------- маски (этап 3)
+
+    def masks(self) -> list:
+        return self.params.setdefault("masks", [])
+
+    def ai_arr(self, name: str, cat: str) -> np.ndarray | None:
+        """ИИ-маска кадра (uint8, весь кадр) из памяти или из PNG рядом со снимками."""
+        key = (name, cat)
+        if key not in self.ai_cache and self.folder:
+            f = self.folder / MASKS_DIR / f"{name}.{cat}.png"
+            if f.exists():
+                self.ai_cache[key] = cv2.imdecode(np.frombuffer(f.read_bytes(), np.uint8), cv2.IMREAD_GRAYSCALE)
+        return self.ai_cache.get(key)
+
+    def ai_arr_for_layer(self, layer: dict) -> np.ndarray | None:
+        return self.ai_arr(self.current.name, layer["cat"]) if self.current else None
+
+    def render_params(self, p: dict | None = None, name: str | None = None) -> dict:
+        """Копия правок для фоновой обработки: маски отдельно от окна, ИИ-слои с массивами."""
+        p = self.params if p is None else p
+        name = name or (self.current.name if self.current else "")
+        layers = []
+        for layer in p.get("masks", []):
+            c = copy.deepcopy(layer)
+            if c["type"] == "ai":
+                c["arr"] = self.ai_arr(name, c["cat"])
+            layers.append(c)
+        return {**p, "masks": layers}
+
+    def refresh_mask_list(self, select: int | None = None):
+        layers = self.masks()
+        if select is None:  # сохраняем выбранный слой, если он есть в новом списке
+            select = next((i for i, lay in enumerate(layers) if lay is self.editor.layer), -1)
+        self.mask_list.blockSignals(True)
+        self.mask_list.clear()
+        for lay in layers:
+            it = QListWidgetItem(lay["name"])
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+            it.setCheckState(Qt.Checked if lay.get("on", True) else Qt.Unchecked)
+            self.mask_list.addItem(it)
+        self.mask_list.setCurrentRow(select)
+        self.mask_list.blockSignals(False)
+        self.on_mask_select(select)
+
+    def on_mask_select(self, row: int):
+        layers = self.masks()
+        layer = layers[row] if 0 <= row < len(layers) else None
+        if layer is not self.editor.layer:
+            self.editor.set_layer(layer)
+        self.mask_box.setVisible(layer is not None)
+        if layer is not None:
+            kind = layer["type"]
+            self.brush_size_row.setVisible(kind == "brush")
+            self.brush_erase.setVisible(kind == "brush")
+            self.mask_feather_row.setVisible(kind in ("brush", "radial"))
+            self.mask_feather_row.set_value(layer.get("feather", 50))
+            self.mask_invert.blockSignals(True)
+            self.mask_invert.setChecked(layer.get("invert", False))
+            self.mask_invert.blockSignals(False)
+            for key, r in self.mask_rows.items():
+                r.set_value(layer["adj"].get(key, 0))
+        self.view.update()
+
+    def add_mask(self, kind: str):
+        if self.base is None:
+            return
+        if kind == "brush":
+            self.masks().append(MK.new_layer("brush", feather=self.mask_feather_row.slider.value() or 50))
+            self.refresh_mask_list(select=len(self.masks()) - 1)
+            self.toast("Рисуйте по кадру левой кнопкой. Alt — стереть, правая кнопка — сдвинуть кадр", 8000)
+            return
+        self.mask_list.setCurrentRow(-1)
+        self.editor.set_layer(None)
+        self.editor.creating = kind
+        self.mask_box.hide()
+        what = "от места, где правка полная, до места, где она сходит на нет" if kind == "linear" \
+            else "от центра наружу — получится овал"
+        self.toast(f"Протяните мышью по кадру {what}", 8000)
+
+    def on_mask_created(self, layer: dict):
+        self.masks().append(layer)
+        self.refresh_mask_list(select=len(self.masks()) - 1)
+        self.toast("Готово. Теперь двигайте ползунки маски; ручки на кадре меняют форму")
+
+    def on_mask_geom(self):
+        self.request_render()
+        self.view.update()
+
+    def on_mask_adj(self, key: str, value: int):
+        if self.editor.layer is not None:
+            self.editor.layer["adj"][key] = value
+            self.request_render()
+
+    def on_mask_invert(self, on: bool):
+        if self.editor.layer is not None:
+            self.editor.layer["invert"] = on
+            self.editor.invalidate()
+            self.on_mask_geom()
+
+    def on_mask_feather(self, _key: str, value: int):
+        if self.editor.layer is not None:
+            self.editor.layer["feather"] = value
+            self.editor.brush_feather = value
+            self.editor.invalidate()
+            self.on_mask_geom()
+
+    def on_mask_show(self, on: bool):
+        self.editor.show_overlay = on
+        self.editor.invalidate()
+        self.view.update()
+
+    def on_mask_item(self, it: QListWidgetItem):
+        row = self.mask_list.row(it)
+        layer = self.masks()[row]
+        layer["on"] = it.checkState() == Qt.Checked
+        layer["name"] = it.text().strip() or layer["name"]
+        self.editor.invalidate()
+        self.on_mask_geom()
+
+    def delete_mask(self):
+        layer = self.editor.layer
+        if layer is None:
+            return
+        self.masks().remove(layer)
+        self.editor.set_layer(None)
+        self.refresh_mask_list(select=-1)
+        self.request_render()
+        self.toast(f"Маска «{layer['name']}» удалена")
+
+    def add_ai_mask(self, cat: str):
+        if not G.available():
+            QMessageBox.information(self, "Нужны библиотеки ИИ",
+                                    "Для масок ИИ нужен PyTorch и transformers (один раз).\n"
+                                    "Запустите install_ai.bat в папке программы, затем перезапустите её.")
+            return
+        if self.base is None:
+            return
+        label = G.CATEGORIES[cat][0]
+        if self.ai_arr(self.current.name, cat) is not None:
+            self._create_ai_layer(cat)
+            return
+        first = self.segmenter is None
+        self.toast(f"Ищу «{label}» на кадре…" + (" В первый раз загружается модель (~110 МБ)" if first else ""), 0)
+        run_task(segment_job, self.segmenter, self.current, self.base, [cat], True,
+                 done=self.on_segmented, fail=lambda m: self.toast(f"Маска ИИ не получилась: {m}", 10000))
+
+    def ensure_ai_masks(self):
+        """У кадра есть ИИ-слои без готовой маски (например, после вставки правок) — досчитать в фоне."""
+        cats = sorted({m["cat"] for m in self.masks() if m["type"] == "ai"
+                       and self.ai_arr(self.current.name, m["cat"]) is None})
+        if cats and G.available():
+            run_task(segment_job, self.segmenter, self.current, self.base, cats, False,
+                     done=self.on_segmented, fail=lambda m: self.toast(f"Маска ИИ не получилась: {m}", 10000))
+
+    def on_segmented(self, res):
+        self.segmenter, path, maps, create = res
+        for cat, arr in maps.items():
+            self.ai_cache[(path.name, cat)] = arr
+            try:
+                _write_png(path.parent / MASKS_DIR / f"{path.name}.{cat}.png", arr)
+            except OSError as e:
+                self.toast(f"Не удалось сохранить маску: {e}", 8000)
+        if path != self.current:
+            return
+        if create:
+            for cat in maps:
+                self._create_ai_layer(cat)
+        else:
+            self.editor.invalidate()
+            self.request_render()
+
+    def _create_ai_layer(self, cat: str):
+        label = G.CATEGORIES[cat][0]
+        arr = self.ai_arr(self.current.name, cat)
+        self.masks().append(MK.new_layer("ai", cat=cat, name=label))
+        self.refresh_mask_list(select=len(self.masks()) - 1)
+        share = float((arr > 127).mean()) if arr is not None else 0
+        if share < 0.005:
+            self.toast(f"«{label}» на кадре почти не найдено — маска пустая. Попробуйте другую", 10000)
+        else:
+            self.toast(f"Маска «{label}»: {share:.0%} кадра. Включите «Показать (O)», чтобы увидеть её")
 
     # ---------- сцены (этап 1)
 
@@ -1062,7 +1386,7 @@ class MainWindow(QMainWindow):
         self.toast("Правки сброшены")
 
     def copy_settings(self):
-        self.clipboard = dict(self.params)
+        self.clipboard = copy.deepcopy(self.params)
         self.toast("Правки скопированы. Выделите кадры (Ctrl/Shift+щелчок) и нажмите Ctrl+V")
 
     def paste_settings(self):
@@ -1071,9 +1395,9 @@ class MainWindow(QMainWindow):
             return
         items = self.strip.selectedItems()
         for it in items:
-            self.sidecar[Path(it.data(PATH_ROLE)).name] = dict(self.clipboard)
+            self.sidecar[Path(it.data(PATH_ROLE)).name] = copy.deepcopy(self.clipboard)
         if self.current and self.current.name in {Path(i.data(PATH_ROLE)).name for i in items}:
-            self.params = dict(self.clipboard)
+            self.params = self.sidecar[self.current.name]
             self.sync_controls()
             self.request_render()
         self.save_sidecar()
@@ -1328,18 +1652,45 @@ class MainWindow(QMainWindow):
         if not paths:
             self.toast("Нечего экспортировать: все выбранные кадры отмечены как размытые")
             return
-        out_dir = Path(dlg.out.text())
+        opts = {"out": Path(dlg.out.text()), "scene": dlg.scene_look.isChecked(), "auto": dlg.auto.isChecked(),
+                "edge": dlg.edge.value(), "quality": dlg.quality.value()}
+        self.save_sidecar()
+        missing = []
+        for p in paths:
+            layers = E.normalize_params(self.sidecar.get(p.name, self.params)).get("masks", [])
+            cats = sorted({m["cat"] for m in layers if m["type"] == "ai" and self.ai_arr(p.name, m["cat"]) is None})
+            if cats:
+                missing.append((str(p), cats))
+        if missing and G.available():
+            self.toast(f"Готовлю маски ИИ для кадров: {len(missing)}…", 0)
+            self.a_export.setEnabled(False)
+
+            def ready(seg):
+                self.segmenter = seg
+                self._run_export(paths, opts)
+
+            def failed(msg):
+                self.a_export.setEnabled(True)
+                self.toast(f"Маски ИИ не подготовлены ({msg}). Экспорт без них", 8000)
+                self._run_export(paths, opts)
+
+            run_task(prepare_ai_job, self.segmenter, missing, str(self.folder / MASKS_DIR), done=ready, fail=failed)
+            return
+        self._run_export(paths, opts)
+
+    def _run_export(self, paths: list[Path], opts: dict):
+        out_dir = opts["out"]
         jobs = []
         for p in paths:
             params = E.normalize_params(self.sidecar.get(p.name, self.params))
-            sc = self.scene_for(p.name) if dlg.scene_look.isChecked() else None
+            sc = self.scene_for(p.name) if opts["scene"] else None
             look = self.looks.get((sc or params).get("look") or "")
-            jobs.append({"scene": sc, "src": str(p), "dst": str(out_dir / f"{p.stem}.jpg"), "params": params,
+            jobs.append({"scene": sc, "src": str(p), "dst": str(out_dir / f"{p.stem}.jpg"),
+                         "params": self.render_params(params, p.name),
                          "style": self.style_for(params),
                          "look": look,
-                         "auto": dlg.auto.isChecked(), "long_edge": dlg.edge.value(),
-                         "quality": dlg.quality.value()})
-        self.save_sidecar()
+                         "auto": opts["auto"], "long_edge": opts["edge"],
+                         "quality": opts["quality"]})
         self.export_dir = out_dir
         self.progress.setRange(0, len(jobs))
         self.progress.setValue(0)

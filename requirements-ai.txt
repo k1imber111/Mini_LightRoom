@@ -2,3 +2,4 @@
 # PyTorch ставится ДО этого файла отдельной командой с --index-url https://download.pytorch.org/whl/cu128:
 # в одном файле pip предпочтёт более новую CPU-сборку с PyPI, и видеокарта не будет задействована.
 open_clip_torch
+transformers   # маски ИИ (этап 3): SegFormer ADE20K
