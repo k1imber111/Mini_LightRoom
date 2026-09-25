@@ -38,6 +38,24 @@ assert half.shape == (200, 200, 3)
 ramp = np.linspace(0, 1, 256, dtype=np.float32)[None, :, None].repeat(3, 2)
 assert (np.diff(E.process(ramp, {**E.default_params(), "contrast": 200})[0, :, 0]) >= -1e-6).all()
 
+# Пресеты-образы: все встроенные рабочие, сила 0 — без изменений, 50% — ровно середина.
+looks = E.load_looks(Path(__file__).resolve().parent.parent / "looks")
+assert 20 <= len(looks) <= 30, len(looks)
+small = img[:200, :300]
+for name, look in looks.items():
+    full_look = E.apply_look(small, look, 1.0)
+    assert full_look.shape == small.shape and np.isfinite(full_look).all(), name
+    assert 0 <= full_look.min() and full_look.max() <= 1 + 1e-5, name
+    assert np.abs(E.apply_look(small, look, 0.0) - small).max() < 1e-6, name
+    assert np.abs(E.apply_look(small, look, 0.5) - (small + full_look) / 2).max() < 1e-5, name
+for look in looks.values():
+    for key in ("curve", "r", "g", "b"):
+        if key in look:
+            assert (np.diff(E.curve_lut(look[key])) >= 0).all(), (look["name"], key)
+t = time.perf_counter()
+E.process(img, {**p, "look": "x"}, look=next(iter(looks.values())))
+print(f"обработка с пресетом: {(time.perf_counter() - t) * 1000:.0f} мс")
+
 print("авто:", E.auto_params(img * 0.3))
 assert E.auto_params(img * 0.3)["exposure"] > 0, "тёмный кадр должен осветляться"
 

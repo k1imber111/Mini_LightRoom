@@ -66,6 +66,7 @@ from . import engine as E
 
 APP_DIR = Path(__file__).resolve().parent.parent
 STYLES_DIR = APP_DIR / "styles"
+LOOKS_DIR = APP_DIR / "looks"
 PRESETS_DIR = APP_DIR / "presets"
 SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат рядом со снимками
 PREVIEW_SIDE = 1400
@@ -129,18 +130,24 @@ def preview_job(path):
     return path, E.load_image(path, half=True, max_side=PREVIEW_SIDE), E.full_size(path)
 
 
+def look_icons_job(path, base, params, style, looks):
+    """Миниатюры текущего кадра под каждым пресетом — видно, что выбираешь."""
+    small = E.process(E.resize_max(base, 84), {**params, "look": "", "vignette": 0, "sharpness": 0}, style)
+    return path, {name: to_u8(E.apply_look(small, look)) for name, look in looks.items()}
+
+
 def full_job(path):
     return path, E.load_image(path, half=False)
 
 
-def detail_job(gen, full, base, rect, scale, params, style):
+def detail_job(gen, full, base, rect, scale, params, style, look):
     src_stats = E.style_source_stats(base, params) if style else None  # стиль — как у всего кадра
-    before, after = E.process_region(full, rect, scale, params, style, src_stats)
+    before, after = E.process_region(full, rect, scale, params, style, src_stats, look)
     return gen, rect, to_u8(before), to_u8(after)
 
 
-def render_job(gen, base, params, style):
-    out = to_u8(E.process(base, params, style))
+def render_job(gen, base, params, style, look):
+    out = to_u8(E.process(base, params, style, look=look))
     hist = [np.histogram(out[..., c], bins=64, range=(0, 256))[0] for c in range(3)]
     return gen, out, hist
 
@@ -359,7 +366,7 @@ class SliderRow(QWidget):
     def _show(self, v):
         if self.key == "exposure":
             self.value.setText(f"{v / 100:+.2f} EV")
-        elif self.key in ("sharpness", "style_strength"):
+        elif self.key in ("sharpness", "style_strength", "look_strength"):
             self.value.setText(f"{v}")
         else:
             self.value.setText(f"{v:+d}" if v else "0")
@@ -499,6 +506,7 @@ class MainWindow(QMainWindow):
         self._build_status()
         self.reload_styles()
         self.reload_presets()
+        self.reload_looks()
         self._set_enabled(False)
 
     # ---------- построение интерфейса
@@ -581,6 +589,19 @@ class MainWindow(QMainWindow):
             groups[group].addWidget(row)
             self.rows[key] = row
 
+        # Готовые пресеты-образы с силой
+        box = QGroupBox("Пресеты")
+        ll = QVBoxLayout(box)
+        self.look_combo = QComboBox()
+        self.look_combo.setIconSize(QSize(64, 44))
+        self.look_combo.setMaxVisibleItems(14)
+        self.look_combo.currentIndexChanged.connect(self.on_look)
+        ll.addWidget(self.look_combo)
+        self.rows["look_strength"] = SliderRow("look_strength", "Сила пресета", 0, 100)
+        self.rows["look_strength"].changed.connect(self.on_param)
+        ll.addWidget(self.rows["look_strength"])
+        pl.addWidget(box)
+
         # Стиль с чужого фото
         box = QGroupBox("Стиль с референса")
         sl = QVBoxLayout(box)
@@ -601,7 +622,7 @@ class MainWindow(QMainWindow):
         pl.addWidget(box)
 
         # Пресеты
-        box = QGroupBox("Пресеты")
+        box = QGroupBox("Мои пресеты")
         prl = QHBoxLayout(box)
         self.preset_combo = QComboBox()
         self.preset_combo.activated.connect(self.apply_preset)
@@ -733,6 +754,7 @@ class MainWindow(QMainWindow):
         self._set_enabled(True)
         self.view.message = ""
         self.request_render()
+        self.refresh_look_icons()
 
     def on_error(self, msg):
         self.view.message = f"Не получилось открыть кадр:\n{msg}"
@@ -760,6 +782,9 @@ class MainWindow(QMainWindow):
         idx = self.style_combo.findText(self.params.get("style") or "— без стиля —")
         self.style_combo.setCurrentIndex(max(0, idx))
         self.style_combo.blockSignals(False)
+        self.look_combo.blockSignals(True)
+        self.look_combo.setCurrentIndex(max(0, self.look_combo.findData(self.params.get("look") or "")))
+        self.look_combo.blockSignals(False)
 
     def on_param(self, key, value):
         self.params[key] = value
@@ -768,6 +793,9 @@ class MainWindow(QMainWindow):
     def current_style(self):
         name = self.params.get("style")
         return self.styles.get(name) if name else None
+
+    def current_look(self):
+        return self.looks.get(self.params.get("look") or "")
 
     def request_render(self):
         self.detail_gen += 1  # деталь с прежними правками больше не годится
@@ -779,7 +807,7 @@ class MainWindow(QMainWindow):
             return
         self.rendering = True
         self.gen += 1
-        run_task(render_job, self.gen, self.base, dict(self.params), self.current_style(),
+        run_task(render_job, self.gen, self.base, dict(self.params), self.current_style(), self.current_look(),
                  done=self.on_rendered, fail=self.on_render_fail)
 
     def on_rendered(self, res):
@@ -838,7 +866,7 @@ class MainWindow(QMainWindow):
             return
         self.detail_busy = True
         run_task(detail_job, self.detail_gen, self.full, self.base, rect, min(1.0, v.scale()),
-                 dict(self.params), self.current_style(), done=self.on_detail, fail=self.on_detail_fail)
+                 dict(self.params), self.current_style(), self.current_look(), done=self.on_detail, fail=self.on_detail_fail)
 
     def on_full(self, res):
         path, img = res
@@ -962,8 +990,49 @@ class MainWindow(QMainWindow):
             return
         no_style = {**self.params, "style": ""}
         src = E.lab_stats(E.process(self.base, no_style, None, local=False))
-        E.export_cube(path, self.params, self.current_style(), src)
+        E.export_cube(path, self.params, self.current_style(), src, look=self.current_look())
         self.toast(f"LUT сохранён: {path}. Света/тени, чёткость и резкость в LUT не входят", 8000)
+
+    # ---------- пресеты-образы
+
+    def reload_looks(self):
+        self.looks = E.load_looks(LOOKS_DIR)
+        c = self.look_combo
+        c.blockSignals(True)
+        c.clear()
+        c.addItem("— без пресета —", "")
+        group = None
+        for name, look in self.looks.items():
+            if look.get("group") != group:
+                group = look.get("group")
+                c.addItem(f"— {group or 'Другие'} —")
+                c.model().item(c.count() - 1).setEnabled(False)
+            c.addItem(name, name)
+            c.setItemData(c.count() - 1, look.get("hint", ""), Qt.ToolTipRole)
+        c.blockSignals(False)
+
+    def on_look(self, idx):
+        name = self.look_combo.itemData(idx) or ""
+        self.params["look"] = name
+        self.look_combo.setToolTip(self.looks.get(name, {}).get("hint", "Готовые мягкие образы; сила — ползунок ниже"))
+        self.request_render()
+        if name:
+            self.toast(f"Пресет «{name}». Силу меняет ползунок «Сила пресета»")
+
+    def refresh_look_icons(self):
+        if self.base is None or not self.looks:
+            return
+        run_task(look_icons_job, self.current, self.base, dict(self.params), self.current_style(), self.looks,
+                 done=self.on_look_icons)
+
+    def on_look_icons(self, res):
+        path, icons = res
+        if path != self.current:
+            return
+        for name, u8 in icons.items():
+            i = self.look_combo.findData(name)
+            if i >= 0:
+                self.look_combo.setItemIcon(i, QIcon(QPixmap.fromImage(to_qimage(u8))))
 
     # ---------- пресеты
 
@@ -1017,6 +1086,7 @@ class MainWindow(QMainWindow):
             params = self.sidecar.get(p.name, self.params)
             jobs.append({"src": str(p), "dst": str(out_dir / f"{p.stem}.jpg"), "params": params,
                          "style": self.styles.get(params.get("style") or ""),
+                         "look": self.looks.get(params.get("look") or ""),
                          "auto": dlg.auto.isChecked(), "long_edge": dlg.edge.value(),
                          "quality": dlg.quality.value()})
         self.save_sidecar()

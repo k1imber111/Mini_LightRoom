@@ -38,7 +38,7 @@ SLIDERS = [
 
 def default_params() -> dict:
     p = {key: 0 for key, *_ in SLIDERS}
-    p.update(style="", style_strength=70)
+    p.update(style="", style_strength=70, look="", look_strength=100)
     return p
 
 
@@ -153,6 +153,120 @@ def _apply_style(img, style, strength, src_stats):
     return img + (out - img) * strength
 
 
+# ---------------------------------------------------------------- пресеты-образы (looks)
+# Рецепт — dict из looks/*.json. Все операции поточечные, поэтому образ попадает и в LUT.
+# Шкалы как в Lightroom: кривые 0..255, HSL ±100, тонирование — оттенок в градусах и сила 0..100.
+
+HSL_CENTERS = {"red": 0, "orange": 30, "yellow": 60, "green": 120, "aqua": 180,
+               "blue": 225, "purple": 270, "magenta": 315}
+
+
+def curve_lut(points, n: int = 1024) -> np.ndarray:
+    """Монотонная кубическая кривая (Фритч — Карлсон) по точкам 0..255: без выбросов и ступенек."""
+    pts = np.array(sorted(points), np.float64) / 255.0
+    x, y = pts[:, 0], pts[:, 1]
+    xs = np.linspace(0, 1, n)
+    if len(x) < 3:
+        return np.interp(xs, x, y).astype(np.float32)
+    d = np.diff(y) / np.diff(x)
+    m = np.concatenate([[d[0]], (d[:-1] + d[1:]) / 2, [d[-1]]])
+    for i, di in enumerate(d):
+        if di == 0:
+            m[i] = m[i + 1] = 0
+        else:
+            a, b = m[i] / di, m[i + 1] / di
+            r = a * a + b * b
+            if r > 9:
+                t = 3 / np.sqrt(r)
+                m[i], m[i + 1] = t * a * di, t * b * di
+    k = np.clip(np.searchsorted(x, xs) - 1, 0, len(x) - 2)
+    h = x[k + 1] - x[k]
+    t = (xs - x[k]) / h
+    out = ((2 * t ** 3 - 3 * t ** 2 + 1) * y[k] + (t ** 3 - 2 * t ** 2 + t) * h * m[k]
+           + (-2 * t ** 3 + 3 * t ** 2) * y[k + 1] + (t ** 3 - t ** 2) * h * m[k + 1])
+    return np.clip(out, 0, 1).astype(np.float32)
+
+
+def _apply_curve(ch: np.ndarray, points) -> np.ndarray:
+    lut = curve_lut(points)
+    return lut[(np.clip(ch, 0, 1) * (len(lut) - 1) + 0.5).astype(np.int32)]
+
+
+def _hue_rgb(hue: float) -> np.ndarray:
+    """Направление сдвига цвета для тонирования: чистый оттенок без изменения яркости."""
+    rgb = cv2.cvtColor(np.array([[[hue, 1.0, 1.0]]], np.float32), cv2.COLOR_HSV2RGB)[0, 0]
+    return rgb - rgb @ LUM
+
+
+def _apply_hsl(img: np.ndarray, hsl: dict) -> np.ndarray:
+    # Сдвиги зависят только от оттенка: считаем таблицу на 360° и берём из неё по пикселям.
+    deg = np.arange(360, dtype=np.float32)
+    tab = np.zeros((3, 360), np.float32)
+    total = np.zeros(360, np.float32)
+    for name, (sh, ss, sl) in hsl.items():
+        w = np.clip(1 - np.abs((deg - HSL_CENTERS[name] + 180) % 360 - 180) / 45, 0, 1)
+        total += w
+        tab += w * np.array([[sh * 0.3], [ss / 100], [sl / 100]], np.float32)  # оттенок ±100 → ±30°
+    tab /= np.maximum(total, 1)  # в зазорах между цветами влияние плавно слабеет
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    h, s = hsv[..., 0], hsv[..., 1]
+    i = h.astype(np.int32) % 360
+    hsv[..., 0] = (h + tab[0][i]) % 360
+    hsv[..., 1] = np.clip(s * (1 + tab[1][i]), 0, 1)
+    out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    return out * (1 + 0.5 * tab[2][i] * s)[..., None]  # серые пиксели яркость не меняют
+
+
+def apply_look(img: np.ndarray, look: dict, strength: float = 1.0) -> np.ndarray:
+    """Применяет пресет-образ; strength 0..1 плавно смешивает с исходником."""
+    src = np.clip(img, 0, 1).astype(np.float32)
+    out = src.copy()
+    t, m = (v / 100 for v in look.get("wb", (0, 0)))
+    ev = look.get("exposure", 0)
+    if t or m or ev:
+        gain = np.array([1 + 0.25 * t, 1 - 0.2 * m, 1 - 0.25 * t], np.float32) * np.float32(2 ** ev)
+        out = np.clip(out * gain ** (1 / 2.2), 0, 1)  # = (x^2.2 · gain)^(1/2.2), без возведения пикселей
+    if look.get("hsl"):
+        out = np.clip(_apply_hsl(out, look["hsl"]), 0, 1)
+    vib, sat = look.get("vib", 0) / 100, look.get("sat", 0) / 100
+    if vib or sat:
+        gray = (out @ LUM)[..., None]
+        r, g, b = out[..., 0], out[..., 1], out[..., 2]
+        chroma = (np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b))[..., None]  # быстрее max(-1)
+        out = np.clip(gray + (out - gray) * (1 + sat) * (1 + vib * (1 - np.clip(chroma * 1.5, 0, 1))), 0, 1)
+    grade = look.get("grade")
+    if grade:
+        # Сдвиг цвета зависит только от яркости: таблица на 1024 уровня, потом выборка по пикселям.
+        lv = np.linspace(0, 1, 1024, dtype=np.float32)
+        bal = grade.get("balance", 0) / 200  # сдвигает границу теней и светов
+        zones = {"shadows": np.clip(1 - lv / (0.5 + bal), 0, 1) ** 1.5,
+                 "highlights": np.clip((lv - 0.5 - bal) / (0.5 - bal), 0, 1) ** 1.5,
+                 "mid": 1 - np.abs(2 * lv - 1)}
+        tab = np.zeros((1024, 3), np.float32)
+        for zone, w in zones.items():
+            if zone in grade and grade[zone][1]:
+                hue, amount = grade[zone]
+                tab += w[:, None] * (0.35 * amount / 100) * _hue_rgb(hue)
+        out = np.clip(out + tab[(np.clip(out @ LUM, 0, 1) * 1023 + 0.5).astype(np.int32)], 0, 1)
+    if look.get("curve"):
+        out = _apply_curve(out, look["curve"])
+    for i, ch in enumerate("rgb"):
+        if look.get(ch):
+            out[..., i] = _apply_curve(out[..., i], look[ch])
+    return src + (out - src) * strength
+
+
+def load_looks(folder) -> dict:
+    """Все пресеты-образы из папки: {название: рецепт}, в порядке файлов."""
+    looks = {}
+    for f in sorted(Path(folder).glob("*.json")):
+        data = read_json(f, [])
+        for look in data if isinstance(data, list) else [data]:
+            if isinstance(look, dict) and look.get("name"):
+                looks[look["name"]] = look
+    return looks
+
+
 # ---------------------------------------------------------------- обработка
 
 def _smooth(ch: np.ndarray, sigma: float) -> np.ndarray:
@@ -168,10 +282,10 @@ def _smooth(ch: np.ndarray, sigma: float) -> np.ndarray:
 
 def process(img: np.ndarray, p: dict, style: dict | None = None,
             src_stats: dict | None = None, local: bool = True,
-            frame: tuple | None = None) -> np.ndarray:
+            frame: tuple | None = None, look: dict | None = None) -> np.ndarray:
     """Применяет все правки. local=False — только поточечные операции (для LUT).
     frame=(ширина, высота, x0, y0) — img вырезан из кадра такого размера: размытия и виньетка
-    считаются как для целого кадра (просмотр в масштабе)."""
+    считаются как для целого кадра (просмотр в масштабе). look — пресет-образ, его сила в p["look_strength"]."""
     g = lambda k: p.get(k, 0) / 100.0
     img = np.maximum(img.astype(np.float32, copy=True), 0)
     h, w = img.shape[:2]
@@ -220,6 +334,9 @@ def process(img: np.ndarray, p: dict, style: dict | None = None,
     if style:
         img = _apply_style(np.clip(img, 0, 1), style, p.get("style_strength", 70) / 100.0, src_stats)
 
+    if look:  # образ — финальный цвет, поверх стиля; виньетка и резкость уже после него
+        img = apply_look(img, look, p.get("look_strength", 100) / 100.0)
+
     if local:
         v = g("vignette")
         if v:
@@ -242,7 +359,8 @@ def style_source_stats(img: np.ndarray, p: dict) -> dict:
 
 
 def process_region(full: np.ndarray, rect: tuple, scale: float, p: dict,
-                   style: dict | None = None, src_stats: dict | None = None) -> tuple:
+                   style: dict | None = None, src_stats: dict | None = None,
+                   look: dict | None = None) -> tuple:
     """Обрабатывает только видимую область кадра (просмотр в масштабе).
     rect=(x0, y0, x1, y1) в пикселях full; scale ≤ 1 — уменьшение перед обработкой.
     Возвращает (исходник, результат) области. Вокруг берутся поля под широкие размытия."""
@@ -255,7 +373,7 @@ def process_region(full: np.ndarray, rect: tuple, scale: float, p: dict,
         crop = cv2.resize(crop, (max(1, round((X1 - X0) * scale)), max(1, round((Y1 - Y0) * scale))),
                           interpolation=cv2.INTER_AREA)
     k = crop.shape[1] / (X1 - X0)
-    out = process(crop, p, style, src_stats, frame=(W * k, H * k, X0 * k, Y0 * k))
+    out = process(crop, p, style, src_stats, frame=(W * k, H * k, X0 * k, Y0 * k), look=look)
     ix0, iy0 = round((x0 - X0) * k), round((y0 - Y0) * k)
     ix1, iy1 = ix0 + max(1, round((x1 - x0) * k)), iy0 + max(1, round((y1 - y0) * k))
     return crop[iy0:iy1, ix0:ix1], out[iy0:iy1, ix0:ix1]
@@ -292,12 +410,13 @@ def auto_params(img: np.ndarray) -> dict:
 
 # ---------------------------------------------------------------- LUT
 
-def export_cube(path, p: dict, style: dict | None, src_stats: dict | None, size: int = 33) -> None:
+def export_cube(path, p: dict, style: dict | None, src_stats: dict | None, size: int = 33,
+                look: dict | None = None) -> None:
     """3D LUT с поточечными правками и стилем: для Lightroom, DaVinci, телефона."""
     axis = np.linspace(0, 1, size, dtype=np.float32)
     b, g, r = np.meshgrid(axis, axis, axis, indexing="ij")  # в .cube R меняется быстрее всех
     grid = np.stack([r, g, b], -1).reshape(-1, 1, 3)
-    out = process(grid, p, style, src_stats=src_stats, local=False).reshape(-1, 3)
+    out = process(grid, p, style, src_stats=src_stats, local=False, look=look).reshape(-1, 3)
     lines = [f'TITLE "{Path(path).stem}"', f"LUT_3D_SIZE {size}", "DOMAIN_MIN 0 0 0", "DOMAIN_MAX 1 1 1"]
     lines += [f"{x:.6f} {y:.6f} {z:.6f}" for x, y, z in out]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -310,7 +429,7 @@ def export_one(job: dict) -> str:
     params = dict(job["params"])
     if job.get("auto"):
         params.update(auto_params(img))  # тон — под кадр, стиль и цвет — ваши
-    out = process(img, params, job.get("style"))
+    out = process(img, params, job.get("style"), look=job.get("look"))
     if job.get("long_edge"):
         out = resize_max(out, int(job["long_edge"]))
     save_jpeg(job["dst"], out, job.get("quality", 92))

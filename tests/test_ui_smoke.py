@@ -62,6 +62,16 @@ if __name__ == "__main__":
         win.request_render()
         wait(app, lambda: not win.rendering and not win.dirty)
 
+        # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
+        assert len(win.looks) >= 20
+        name = next(iter(win.looks))
+        win.look_combo.setCurrentIndex(win.look_combo.findData(name))
+        assert win.params["look"] == name
+        wait(app, lambda: not win.look_combo.itemIcon(win.look_combo.findData(name)).isNull())
+        win.rows["look_strength"].slider.setValue(60)
+        wait(app, lambda: not win.rendering and not win.dirty)
+        assert win.params["look_strength"] == 60
+
         # масштаб: превью 400 px меньше кадра 900 px → на 100% дорисовывается полное разрешение
         assert (win.view.src_w, win.view.src_h) == (900, 600)
         win.view.set_zoom(1.0)
@@ -77,8 +87,10 @@ if __name__ == "__main__":
         wait(app, lambda: win.current and win.current.name == "кадр_1.jpg" and win.base is not None)
         assert "кадр_0.jpg" in win.sidecar, "правки первого кадра не запомнились"
 
+        assert win.sidecar["кадр_0.jpg"]["look"] == name, "пресет не сохранился в правках кадра"
         jobs = [{"src": str(p), "dst": str(d / "export" / f"{p.stem}.jpg"), "params": win.sidecar["кадр_0.jpg"],
-                 "style": style, "auto": True, "long_edge": 500, "quality": 90} for p in win.files]
+                 "style": style, "look": win.looks[name], "auto": True, "long_edge": 500, "quality": 90}
+                for p in win.files]
         from mini_lightroom.ui import ExportThread
         th = ExportThread(jobs)
         result = {}
