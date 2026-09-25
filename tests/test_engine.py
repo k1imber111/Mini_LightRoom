@@ -108,6 +108,32 @@ t = time.perf_counter()
 E.process(img, pm)
 print(f"обработка с 4 масками: {(time.perf_counter() - t) * 1000:.0f} мс")
 
+# Шумодав и увеличение (этап 4).
+from mini_lightroom import enhance as N  # noqa: E402
+
+assert N.iso_strength(800) == 0 and N.iso_strength(1600) == 30 and N.iso_strength(6400) == 70
+assert N.iso_strength(25600) == 85 and N.iso_strength(None) == 0
+marks = []
+E.process_region(img, (600, 300, 1000, 700), 1.0, E.default_params(),
+                 prep=lambda c, box: marks.append((c.shape, box)) or c)
+(ch, cw, _), (bx0, by0, bx1, by1) = marks[0]
+assert (bx1 - bx0, by1 - by0) == (400, 400) and bx0 > 0 and by0 > 0, "prep получил не ту видимую часть"
+if N.available() and (N.MODELS_DIR / N.MODELS["denoise"][0]).exists():
+    clean = np.full((600, 700, 3), 0.4, np.float32) + np.linspace(0, 0.3, 700, dtype=np.float32)[None, :, None]
+    noisy = np.clip(clean + np.random.default_rng(3).normal(0, 0.05, clean.shape).astype(np.float32), 0, 1)
+    t = time.perf_counter()
+    dn = N.denoise(noisy, 1.0)
+    err0, err1 = np.abs(noisy - clean).mean(), np.abs(dn - clean).mean()
+    print(f"шумодав: ошибка {err0:.4f} → {err1:.4f} за {time.perf_counter() - t:.1f} с")
+    assert dn.shape == noisy.shape and err1 < err0 * 0.5, "шумодав не убрал шум"
+    seam = np.abs(np.diff(dn[508:516], axis=0)).mean()
+    assert seam < np.abs(np.diff(dn, axis=0)).mean() * 2 + 1e-3, "шов на границе тайлов"
+    assert np.abs(N.denoise(noisy, 0.0) - noisy).max() == 0
+    if (N.MODELS_DIR / N.MODELS["x2"][0]).exists():
+        assert N.upscale(clean[:100, :150], 2).shape == (200, 300, 3)
+else:
+    print("шумодав: библиотеки ИИ или веса не установлены — пропускаю проверку сети")
+
 # Пресеты-образы: все встроенные рабочие, сила 0 — без изменений, 50% — ровно середина.
 looks = E.load_looks(Path(__file__).resolve().parent.parent / "looks")
 assert 20 <= len(looks) <= 30, len(looks)

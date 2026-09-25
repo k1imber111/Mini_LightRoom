@@ -35,6 +35,8 @@ SLIDERS = [
     ("saturation", "Насыщенность", -100, 200, "Цвет"),
     ("sharpness", "Резкость", 0, 200, "Детали"),
     ("vignette", "Виньетка", -200, 200, "Детали"),
+    # Шумодав (ИИ, enhance.py) применяется к исходнику до process(), поэтому process его не трогает.
+    ("denoise", "Шумодав", 0, 100, "Детали"),
 ]
 
 
@@ -447,10 +449,11 @@ def style_source_stats(img: np.ndarray, p: dict) -> dict:
 
 def process_region(full: np.ndarray, rect: tuple, scale: float, p: dict,
                    style: dict | None = None, src_stats: dict | None = None,
-                   look: dict | None = None) -> tuple:
+                   look: dict | None = None, prep=None) -> tuple:
     """Обрабатывает только видимую область кадра (просмотр в масштабе).
     rect=(x0, y0, x1, y1) в пикселях full; scale ≤ 1 — уменьшение перед обработкой.
-    Возвращает (исходник, результат) области. Вокруг берутся поля под широкие размытия."""
+    Возвращает (исходник, результат) области. Вокруг берутся поля под широкие размытия.
+    prep(crop, (ix0, iy0, ix1, iy1)) — подготовка вырезки до правок (шумодав): видимая часть внутри полей."""
     H, W = full.shape[:2]
     x0, y0, x1, y1 = rect
     m = W // 20  # 2σ размытия теней/светов
@@ -460,9 +463,10 @@ def process_region(full: np.ndarray, rect: tuple, scale: float, p: dict,
         crop = cv2.resize(crop, (max(1, round((X1 - X0) * scale)), max(1, round((Y1 - Y0) * scale))),
                           interpolation=cv2.INTER_AREA)
     k = crop.shape[1] / (X1 - X0)
-    out = process(crop, p, style, src_stats, frame=(W * k, H * k, X0 * k, Y0 * k), look=look)
     ix0, iy0 = round((x0 - X0) * k), round((y0 - Y0) * k)
     ix1, iy1 = ix0 + max(1, round((x1 - x0) * k)), iy0 + max(1, round((y1 - y0) * k))
+    src = prep(crop, (ix0, iy0, ix1, iy1)) if prep else crop
+    out = process(src, p, style, src_stats, frame=(W * k, H * k, X0 * k, Y0 * k), look=look)
     return crop[iy0:iy1, ix0:ix1], out[iy0:iy1, ix0:ix1]
 
 
@@ -526,6 +530,12 @@ def export_cube(path, p: dict, style: dict | None, src_stats: dict | None, size:
 def export_one(job: dict) -> str:
     img = load_image(job["src"], half=False)
     params = dict(job["params"])
+    if params.get("denoise") or job.get("upscale"):
+        from . import enhance  # torch грузится только в процессе, которому он нужен
+        if not enhance.available():
+            raise RuntimeError("шумодав и увеличение требуют библиотек ИИ (install_ai.bat)")
+    if params.get("denoise"):
+        img = enhance.denoise(img, params["denoise"] / 100)
     if job.get("scene"):
         params.update(scene_preset(img, job["scene"]))  # авто-тон + пресет сцены кадра
     elif job.get("auto"):
@@ -533,6 +543,8 @@ def export_one(job: dict) -> str:
     out = process(img, params, job.get("style"), look=job.get("look"))
     if job.get("long_edge"):
         out = resize_max(out, int(job["long_edge"]))
+    if job.get("upscale"):
+        out = enhance.upscale(out, int(job["upscale"]))
     save_jpeg(job["dst"], out, job.get("quality", 92))
     return job["dst"]
 

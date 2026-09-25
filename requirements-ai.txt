@@ -3,3 +3,4 @@
 # в одном файле pip предпочтёт более новую CPU-сборку с PyPI, и видеокарта не будет задействована.
 open_clip_torch
 transformers   # маски ИИ (этап 3): SegFormer ADE20K
+spandrel       # шумодав SCUNet и увеличение Real-ESRGAN (этап 4)

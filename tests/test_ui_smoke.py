@@ -138,6 +138,18 @@ if __name__ == "__main__":
         assert [m["type"] for m in saved] == ["linear", "radial", "brush", "ai"]
         win.mask_list.setCurrentRow(-1)
 
+        # шумодав (этап 4): ползунок → превью без шума считается в фоне и смешивается по силе
+        from mini_lightroom import enhance as N
+        if N.available() and (N.MODELS_DIR / N.MODELS["denoise"][0]).exists():
+            win.rows["denoise"].slider.setValue(60)
+            wait(app, lambda: win.base_dn is not None, 120)
+            wait(app, lambda: not win.rendering and not win.dirty)
+            assert win.params["denoise"] == 60 and win.base_dn.shape == win.base.shape
+            win.rows["denoise"].slider.setValue(0)
+            wait(app, lambda: not win.rendering and not win.dirty)
+        else:
+            assert not win.rows["denoise"].isEnabled() or N.available()
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))

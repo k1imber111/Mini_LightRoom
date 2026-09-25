@@ -67,6 +67,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import engine as E
+from . import enhance as N
 from . import masks as MK
 from . import scene as S
 from . import segment as G
@@ -139,7 +140,22 @@ def thumb_job(path):
 
 
 def preview_job(path):
-    return path, E.load_image(path, half=True, max_side=PREVIEW_SIDE), E.full_size(path)
+    return path, E.load_image(path, half=True, max_side=PREVIEW_SIDE), E.full_size(path), N.iso_of(path)
+
+
+def denoise_job(path, base):
+    """Превью без шума на полной силе; ползунок потом только смешивает его с исходником."""
+    return path, N.denoise(base, 1.0)
+
+
+def _denoise_box(crop, box, strength):
+    """Шумодав только видимой части вырезки (+16 px): поля под размытия шум не портит, а время экономится."""
+    x0, y0, x1, y1 = box
+    h, w = crop.shape[:2]
+    X0, Y0, X1, Y1 = max(0, x0 - 16), max(0, y0 - 16), min(w, x1 + 16), min(h, y1 + 16)
+    out = crop.copy()
+    out[Y0:Y1, X0:X1] = N.denoise(crop[Y0:Y1, X0:X1], strength)
+    return out
 
 
 def look_icons_job(path, base, params, style, looks):
@@ -193,11 +209,15 @@ def full_job(path):
 
 def detail_job(gen, full, base, rect, scale, params, style, look):
     src_stats = E.style_source_stats(base, params) if style else None  # стиль — как у всего кадра
-    before, after = E.process_region(full, rect, scale, params, style, src_stats, look)
+    s = params.get("denoise", 0) / 100
+    prep = (lambda c, box: _denoise_box(c, box, s)) if s > 0 and N.available() else None
+    before, after = E.process_region(full, rect, scale, params, style, src_stats, look, prep)
     return gen, rect, to_u8(before), to_u8(after)
 
 
-def render_job(gen, base, params, style, look):
+def render_job(gen, base, params, style, look, dn=None):
+    if dn is not None:  # превью без шума готово — смешиваем по силе шумодава
+        base = base + (dn - base) * (params.get("denoise", 0) / 100)
     out = to_u8(E.process(base, params, style, look=look))
     hist = [np.histogram(out[..., c], bins=64, range=(0, 256))[0] for c in range(3)]
     return gen, out, hist
@@ -494,6 +514,12 @@ class ExportDialog(QDialog):
         self.quality = QSpinBox()
         self.quality.setRange(60, 100)
         self.quality.setValue(92)
+        self.upscale = QComboBox()
+        self.upscale.addItems(["нет", "×2", "×4"])
+        self.upscale.setEnabled(N.available())
+        self.upscale.setToolTip("ИИ-увеличение (Real-ESRGAN) после уменьшения по длинной стороне.\n"
+                                "Для небольших кадров и кропов: 24 Мп ×2 — это 96 Мп и несколько минут."
+                                if N.available() else "Нужны библиотеки ИИ: install_ai.bat")
         self.out = QLineEdit(str(folder / "export"))
         browse = QPushButton("…")
         browse.setFixedWidth(32)
@@ -507,6 +533,7 @@ class ExportDialog(QDialog):
         form = QFormLayout()
         form.addRow("Длинная сторона:", self.edge)
         form.addRow("Качество JPEG:", self.quality)
+        form.addRow("Увеличение (ИИ):", self.upscale)
         form.addRow("Папка:", out_row)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.button(QDialogButtonBox.Ok).setText("Экспортировать")
@@ -537,6 +564,8 @@ class ExportThread(QThread):
 
     def run(self):
         workers = max(1, min(2, (os.cpu_count() or 2) // 4))  # полный RAW занимает ~1 ГБ памяти
+        if any(j.get("upscale") or j["params"].get("denoise") for j in self.jobs):
+            workers = 1  # видеокарта одна: второй процесс только делил бы её и память
         errors, done = [], 0
         with ProcessPoolExecutor(max_workers=workers) as ex:
             futures = {ex.submit(E.export_one, j): j for j in self.jobs}
@@ -591,6 +620,9 @@ class MainWindow(QMainWindow):
         self.scene_of: dict[str, list] = {}
         self.classifier = None
         self.segmenter = None
+        self.isos: dict[str, int | None] = {}
+        self.base_dn: np.ndarray | None = None   # превью текущего кадра без шума (полная сила)
+        self.dn_busy = False
         self.ai_cache: dict[tuple[str, str], np.ndarray] = {}
         self.editor = MaskEditor(self.ai_arr_for_layer)
         self.editor.changed.connect(self.on_mask_geom)
@@ -698,6 +730,11 @@ class MainWindow(QMainWindow):
             row.changed.connect(self.on_param)
             groups[group].addWidget(row)
             self.rows[key] = row
+        self.rows["denoise"].setToolTip(
+            "ИИ-шумодав (SCUNet, на видеокарте). Лучше всего виден в масштабе 100%.\n"
+            "Кадры с высоким ISO получают его сами при открытии." if N.available()
+            else "Нужны библиотеки ИИ: запустите install_ai.bat")
+        self.rows["denoise"].setEnabled(N.available())
 
         # Маски: локальные правки
         box = QGroupBox("Маски")
@@ -861,6 +898,9 @@ class MainWindow(QMainWindow):
         self.cancel_btn = QPushButton("Остановить")
         self.cancel_btn.hide()
         self.cancel_btn.clicked.connect(self.cancel_export)
+        self.iso_label = QLabel()
+        self.iso_label.setStyleSheet("color:#9a9a9a; padding: 0 8px")
+        self.statusBar().addPermanentWidget(self.iso_label)
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().addPermanentWidget(self.cancel_btn)
 
@@ -950,6 +990,7 @@ class MainWindow(QMainWindow):
         self.current = Path(item.data(PATH_ROLE))
         self.base = None
         self.full = self.full_path = None
+        self.base_dn = None
         self.view.message = "Проявляю RAW…"
         self.view.badge = ""
         self.view.update()
@@ -959,14 +1000,16 @@ class MainWindow(QMainWindow):
             run_task(preview_job, self.current, done=self.on_preview, fail=self.on_error)
 
     def on_preview(self, res):
-        path, img, size = res
-        self.cache[path] = (img, size)
+        path, img, size, iso = res
+        self.cache[path] = (img, size, iso)
+        self.isos[path.name] = iso
         if len(self.cache) > 6:
             self.cache.pop(next(iter(self.cache)))
         if path != self.current:
             return
         self.base = img
         self.view.set_source_size(*size)
+        self.iso_label.setText(f"ISO {iso}" if iso else "")
         self.before = to_qimage(to_u8(img))
         saved = self.sidecar.get(path.name)
         self.params = E.normalize_params(saved)
@@ -1043,7 +1086,10 @@ class MainWindow(QMainWindow):
             return
         self.rendering = True
         self.gen += 1
-        run_task(render_job, self.gen, self.base, self.render_params(), self.current_style(), self.current_look(),
+        dn = self.base_dn if self.params.get("denoise") else None
+        if self.params.get("denoise") and dn is None:
+            self.request_denoise()
+        run_task(render_job, self.gen, self.base, self.render_params(), self.current_style(), self.current_look(), dn,
                  done=self.on_rendered, fail=self.on_render_fail)
 
     def on_rendered(self, res):
@@ -1149,6 +1195,30 @@ class MainWindow(QMainWindow):
         self.sync_controls()
         self.request_render()
         self.toast(msg)
+
+    # ---------- шумодав (этап 4)
+
+    def request_denoise(self):
+        if self.dn_busy or not N.available() or self.base is None:
+            return
+        self.dn_busy = True
+        self.toast("Шумодав: считаю превью… (в первый раз загружается модель)", 0)
+        run_task(denoise_job, self.current, self.base, done=self.on_denoised, fail=self.on_denoise_fail)
+
+    def on_denoised(self, res):
+        path, dn = res
+        self.dn_busy = False
+        if path != self.current:  # пока считали, открыли другой кадр
+            if self.params.get("denoise"):
+                self.request_denoise()
+            return
+        self.base_dn = dn
+        self.toast("Шумодав готов. В масштабе 100% видно лучше всего", 4000)
+        self.request_render()
+
+    def on_denoise_fail(self, msg):
+        self.dn_busy = False
+        self.toast(f"Шумодав не сработал: {msg}", 10000)
 
     # ---------- маски (этап 3)
 
@@ -1341,8 +1411,14 @@ class MainWindow(QMainWindow):
         """Авто-параметры кадра: с пресетом сцены, если она известна и галочка включена."""
         sc = self.scene_for(name) if self.scene_auto.isChecked() else None
         if sc and sc.get("look") in self.looks:
-            return E.scene_preset(img, sc), f"Авто по сцене «{sc['name']}»: пресет «{sc['look']}»"
-        return E.auto_params(img), "Авто: тон и баланс белого подобраны под кадр"
+            return (self._with_denoise(name, E.scene_preset(img, sc)),
+                    f"Авто по сцене «{sc['name']}»: пресет «{sc['look']}»")
+        return self._with_denoise(name, E.auto_params(img)), "Авто: тон и баланс белого подобраны под кадр"
+
+    def _with_denoise(self, name: str, auto: dict) -> dict:
+        """Высокий ISO → шумодав в авто (низкий ISO не сбрасывает уже выставленный вручную)."""
+        strength = N.iso_strength(self.isos.get(name)) if N.available() else 0
+        return {**auto, "denoise": strength} if strength else auto
 
     def detect_scenes(self):
         if not S.available():
@@ -1653,6 +1729,7 @@ class MainWindow(QMainWindow):
             self.toast("Нечего экспортировать: все выбранные кадры отмечены как размытые")
             return
         opts = {"out": Path(dlg.out.text()), "scene": dlg.scene_look.isChecked(), "auto": dlg.auto.isChecked(),
+                "upscale": (0, 2, 4)[dlg.upscale.currentIndex()],
                 "edge": dlg.edge.value(), "quality": dlg.quality.value()}
         self.save_sidecar()
         missing = []
@@ -1689,7 +1766,7 @@ class MainWindow(QMainWindow):
                          "params": self.render_params(params, p.name),
                          "style": self.style_for(params),
                          "look": look,
-                         "auto": opts["auto"], "long_edge": opts["edge"],
+                         "auto": opts["auto"], "long_edge": opts["edge"], "upscale": opts["upscale"],
                          "quality": opts["quality"]})
         self.export_dir = out_dir
         self.progress.setRange(0, len(jobs))
