@@ -1,0 +1,27 @@
+# окружение и кэш
+.venv/
+__pycache__/
+*.pyc
+pip_log.txt
+pip_err.txt
+
+# служебное ИИ-ассистентов и IDE
+.claude/
+.cursor/
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+
+# снимки и результаты не храним в репозитории
+*.arw
+*.ARW
+*.dng
+*.DNG
+export/
+*.cube
+models/
+
+# логи пробных запусков
+run_*.txt
+.ruff_cache/

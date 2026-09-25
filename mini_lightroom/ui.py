@@ -1,0 +1,1092 @@
+"""Окно Mini LightRoom (PySide6)."""
+from __future__ import annotations
+
+import os
+import statistics
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+import numpy as np
+from PySide6.QtCore import (
+    QObject,
+    QPointF,
+    QRectF,
+    QRunnable,
+    QSize,
+    Qt,
+    QThread,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPixmap,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+from . import engine as E
+
+APP_DIR = Path(__file__).resolve().parent.parent
+STYLES_DIR = APP_DIR / "styles"
+PRESETS_DIR = APP_DIR / "presets"
+SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат рядом со снимками
+PREVIEW_SIDE = 1400
+PATH_ROLE = Qt.UserRole
+ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 7, 10, 16]  # 1 = 100% (пиксель снимка = пиксель экрана)
+
+
+# ---------------------------------------------------------------- фоновые задачи
+
+class _Signals(QObject):
+    done = Signal(object)
+    fail = Signal(str)
+
+
+class _Task(QRunnable):
+    def __init__(self, fn, args):
+        super().__init__()
+        self.fn, self.args, self.sig = fn, args, _Signals()
+        self.setAutoDelete(False)
+
+    def run(self):
+        try:
+            res = self.fn(*self.args)
+        except Exception as e:  # noqa: BLE001 — показываем любую ошибку пользователю
+            self.sig.fail.emit(f"{type(e).__name__}: {e}")
+        else:
+            self.sig.done.emit(res)
+
+
+_alive: set = set()
+
+
+def run_task(fn, *args, done=None, fail=None, pool: QThreadPool | None = None):
+    t = _Task(fn, args)
+    _alive.add(t)
+    if done:
+        t.sig.done.connect(done)
+    if fail:
+        t.sig.fail.connect(fail)
+    t.sig.done.connect(lambda *_: _alive.discard(t))
+    t.sig.fail.connect(lambda *_: _alive.discard(t))
+    (pool or QThreadPool.globalInstance()).start(t)
+
+
+def to_qimage(rgb_u8: np.ndarray) -> QImage:
+    a = np.ascontiguousarray(rgb_u8)
+    h, w = a.shape[:2]
+    return QImage(a.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+
+
+def to_u8(img: np.ndarray) -> np.ndarray:
+    return (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
+
+
+def thumb_job(path):
+    th = E.load_thumb(path, 512)
+    return path, E.resize_max(th, 200), E.sharpness(th)
+
+
+def preview_job(path):
+    return path, E.load_image(path, half=True, max_side=PREVIEW_SIDE), E.full_size(path)
+
+
+def full_job(path):
+    return path, E.load_image(path, half=False)
+
+
+def detail_job(gen, full, base, rect, scale, params, style):
+    src_stats = E.style_source_stats(base, params) if style else None  # стиль — как у всего кадра
+    before, after = E.process_region(full, rect, scale, params, style, src_stats)
+    return gen, rect, to_u8(before), to_u8(after)
+
+
+def render_job(gen, base, params, style):
+    out = to_u8(E.process(base, params, style))
+    hist = [np.histogram(out[..., c], bins=64, range=(0, 256))[0] for c in range(3)]
+    return gen, out, hist
+
+
+# ---------------------------------------------------------------- виджеты
+
+class ImageView(QWidget):
+    """Кадр по размеру окна или в масштабе. Масштаб — доля от полного разрешения снимка.
+    Поверх растянутого превью рисуется «деталь»: видимая область в полном разрешении."""
+
+    view_changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.pix: QPixmap | None = None
+        self.detail: tuple[QPixmap, QRectF] | None = None  # картинка и её место в пикселях кадра
+        self.src_w, self.src_h = 1, 1                        # полный размер снимка
+        self.zoom: float | None = None                       # None — вписать в окно
+        self.cx = self.cy = 0.0                              # центр обзора в пикселях кадра
+        self._drag = None
+        self.message = "Откройте папку со снимками\nCtrl+O или кнопка «Открыть папку»"
+        self.badge = ""
+        self.setMinimumSize(400, 300)
+        self.setMouseTracking(True)
+
+    def set_image(self, img: QImage | None):
+        self.pix = QPixmap.fromImage(img) if img is not None else None
+        self.update()
+
+    def set_detail(self, detail: tuple[QPixmap, QRectF] | None):
+        self.detail = detail
+        self.update()
+
+    def set_source_size(self, w: int, h: int):
+        self.src_w, self.src_h = max(1, w), max(1, h)
+        self.cx, self.cy = w / 2, h / 2
+        self.detail = None
+        self._clamp()
+        self.update()
+
+    # ---------- геометрия
+
+    def fit_scale(self) -> float:
+        return min(self.width() * 0.97 / self.src_w, self.height() * 0.97 / self.src_h)
+
+    def scale(self) -> float:
+        return self.zoom or self.fit_scale()
+
+    def _clamp(self):
+        s = self.scale()
+        for attr, size, view in (("cx", self.src_w, self.width()), ("cy", self.src_h, self.height())):
+            half = view / 2 / s
+            v = size / 2 if half * 2 >= size else min(max(getattr(self, attr), half), size - half)
+            setattr(self, attr, v)
+
+    def to_widget(self, r: QRectF) -> QRectF:
+        s = self.scale()
+        return QRectF(self.width() / 2 + (r.x() - self.cx) * s, self.height() / 2 + (r.y() - self.cy) * s,
+                      r.width() * s, r.height() * s)
+
+    def visible_rect(self) -> QRectF:
+        """Видимая часть кадра в его пикселях."""
+        s = self.scale()
+        r = QRectF(self.cx - self.width() / 2 / s, self.cy - self.height() / 2 / s,
+                   self.width() / s, self.height() / s)
+        return r.intersected(QRectF(0, 0, self.src_w, self.src_h))
+
+    def set_zoom(self, z: float | None, anchor: QPointF | None = None):
+        """Меняет масштаб, оставляя точку под anchor (координаты виджета) на месте."""
+        anchor = anchor or QPointF(self.width() / 2, self.height() / 2)
+        s0 = self.scale()
+        ix = self.cx + (anchor.x() - self.width() / 2) / s0
+        iy = self.cy + (anchor.y() - self.height() / 2) / s0
+        self.zoom = z if z is None or z > self.fit_scale() * 1.001 else None
+        s1 = self.scale()
+        self.cx = ix - (anchor.x() - self.width() / 2) / s1
+        self.cy = iy - (anchor.y() - self.height() / 2) / s1
+        self._clamp()
+        self.update()
+        self.view_changed.emit()
+
+    def step_zoom(self, direction: int, anchor: QPointF | None = None):
+        s, fit = self.scale(), self.fit_scale()
+        if direction > 0:
+            nxt = next((z for z in ZOOM_STEPS if z > s * 1.001 and z > fit), ZOOM_STEPS[-1])
+        else:
+            nxt = next((z for z in reversed(ZOOM_STEPS) if z < s * 0.999), None)
+            nxt = nxt if nxt is not None and nxt > fit else None
+        self.set_zoom(nxt, anchor)
+
+    # ---------- мышь
+
+    def wheelEvent(self, e):
+        if self.pix and e.angleDelta().y():
+            self.step_zoom(1 if e.angleDelta().y() > 0 else -1, e.position())
+
+    def mouseDoubleClickEvent(self, e):
+        if self.pix:
+            self.set_zoom(None if self.zoom else 1.0, e.position())
+
+    def mousePressEvent(self, e):
+        if self.zoom and e.button() == Qt.LeftButton:
+            self._drag = (e.position(), self.cx, self.cy)
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e):
+        if self._drag:
+            p0, cx, cy = self._drag
+            s = self.scale()
+            self.cx, self.cy = cx - (e.position().x() - p0.x()) / s, cy - (e.position().y() - p0.y()) / s
+            self._clamp()
+            self.update()
+        else:
+            self.setCursor(Qt.OpenHandCursor if self.zoom else Qt.ArrowCursor)
+
+    def mouseReleaseEvent(self, e):
+        if self._drag:
+            self._drag = None
+            self.setCursor(Qt.OpenHandCursor)
+            self.view_changed.emit()
+
+    def resizeEvent(self, e):
+        self._clamp()
+        super().resizeEvent(e)
+        self.view_changed.emit()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#161616"))
+        if self.pix:
+            self._clamp()
+            vis = self.visible_rect()
+            k = self.pix.width() / self.src_w
+            src = QRectF(vis.x() * k, vis.y() * k, vis.width() * k, vis.height() * k)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(self.to_widget(vis), self.pix, src)
+            if self.detail:
+                dpix, rect = self.detail
+                # От 200% показываем пиксели как есть, без сглаживания: так видна реальная резкость.
+                p.setRenderHint(QPainter.SmoothPixmapTransform, self.scale() * rect.width() < dpix.width() * 2)
+                p.drawPixmap(self.to_widget(rect), dpix, QRectF(dpix.rect()))
+        if self.badge:
+            p.setPen(QColor("#ffffff"))
+            r = p.fontMetrics().boundingRect(self.badge).adjusted(-8, -4, 8, 4)
+            r.moveTo(12, 12)
+            p.fillRect(r, QColor(0, 0, 0, 170))
+            p.drawText(r, Qt.AlignCenter, self.badge)
+        if self.message:
+            p.setPen(QColor("#9a9a9a"))
+            p.drawText(self.rect(), Qt.AlignCenter, self.message)
+
+
+class Histogram(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.hist = None
+        self.setFixedHeight(80)
+
+    def set_hist(self, hist):
+        self.hist = hist
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#1b1b1b"))
+        if not self.hist:
+            return
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height() - 2
+        top = max(float(np.sqrt(ch).max()) for ch in self.hist) or 1
+        for ch, color in zip(self.hist, ("#ff5a5a", "#5aff7a", "#5a8cff")):
+            path = QPainterPath()
+            path.moveTo(0, h)
+            n = len(ch)
+            for i, v in enumerate(ch):
+                path.lineTo(i * w / (n - 1), h - np.sqrt(v) / top * (h - 4))
+            path.lineTo(w, h)
+            c = QColor(color)
+            c.setAlpha(90)
+            p.fillPath(path, c)
+
+
+class ResetSlider(QSlider):
+    reset = Signal()
+
+    def mouseDoubleClickEvent(self, e):
+        self.reset.emit()
+
+
+class SliderRow(QWidget):
+    changed = Signal(str, int)
+
+    def __init__(self, key, label, lo, hi):
+        super().__init__()
+        self.key = key
+        self.name = QLabel(label)
+        self.value = QLabel()
+        self.value.setAlignment(Qt.AlignRight)
+        self.value.setMinimumWidth(70)
+        self.slider = ResetSlider(Qt.Horizontal)
+        self.slider.setRange(lo, hi)
+        self.slider.setToolTip("Двойной щелчок — сбросить")
+        self.slider.valueChanged.connect(self._on_change)
+        self.slider.reset.connect(lambda: self.slider.setValue(0))
+        top = QHBoxLayout()
+        top.addWidget(self.name)
+        top.addStretch()
+        top.addWidget(self.value)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(0)
+        lay.addLayout(top)
+        lay.addWidget(self.slider)
+        self._show(0)
+
+    def _show(self, v):
+        if self.key == "exposure":
+            self.value.setText(f"{v / 100:+.2f} EV")
+        elif self.key in ("sharpness", "style_strength"):
+            self.value.setText(f"{v}")
+        else:
+            self.value.setText(f"{v:+d}" if v else "0")
+
+    def _on_change(self, v):
+        self._show(v)
+        self.changed.emit(self.key, v)
+
+    def set_value(self, v):
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(v))
+        self.slider.blockSignals(False)
+        self._show(int(v))
+
+
+# ---------------------------------------------------------------- экспорт
+
+class ExportDialog(QDialog):
+    def __init__(self, parent, n_selected, n_all, folder: Path):
+        super().__init__(parent)
+        self.setWindowTitle("Экспорт в JPEG")
+        self.r_current = QRadioButton("Текущий кадр")
+        self.r_selected = QRadioButton(f"Выделенные кадры ({n_selected})")
+        self.r_all = QRadioButton(f"Все кадры в папке ({n_all})")
+        self.r_selected.setEnabled(n_selected > 1)
+        (self.r_selected if n_selected > 1 else self.r_current).setChecked(True)
+        self.auto = QCheckBox("Авто-тон для каждого кадра")
+        self.auto.setToolTip("Экспозицию, света/тени и баланс белого программа подберёт под каждый снимок,\n"
+                             "а стиль, сочность, чёткость и резкость возьмёт ваши.")
+        self.skip_blur = QCheckBox("Пропускать размытые кадры")
+        self.edge = QSpinBox()
+        self.edge.setRange(0, 12000)
+        self.edge.setSingleStep(500)
+        self.edge.setSpecialValueText("как в оригинале")
+        self.edge.setSuffix(" px")
+        self.quality = QSpinBox()
+        self.quality.setRange(60, 100)
+        self.quality.setValue(92)
+        self.out = QLineEdit(str(folder / "export"))
+        browse = QPushButton("…")
+        browse.setFixedWidth(32)
+        browse.clicked.connect(self._browse)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.out)
+        out_row.addWidget(browse)
+
+        hint = QLabel("Кадры без своих настроек получат настройки текущего кадра.")
+        hint.setStyleSheet("color:#9a9a9a")
+        form = QFormLayout()
+        form.addRow("Длинная сторона:", self.edge)
+        form.addRow("Качество JPEG:", self.quality)
+        form.addRow("Папка:", out_row)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Экспортировать")
+        btns.button(QDialogButtonBox.Cancel).setText("Отмена")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        for w in (self.r_current, self.r_selected, self.r_all, hint, self.auto, self.skip_blur):
+            lay.addWidget(w)
+        lay.addLayout(form)
+        lay.addWidget(btns)
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Куда сохранить", self.out.text())
+        if d:
+            self.out.setText(d)
+
+
+class ExportThread(QThread):
+    progress = Signal(int, int)
+    finished_all = Signal(int, list)
+
+    def __init__(self, jobs):
+        super().__init__()
+        self.jobs = jobs
+        self.stop = False
+
+    def run(self):
+        workers = max(1, min(2, (os.cpu_count() or 2) // 4))  # полный RAW занимает ~1 ГБ памяти
+        errors, done = [], 0
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(E.export_one, j): j for j in self.jobs}
+            for f in as_completed(futures):
+                if self.stop:
+                    ex.shutdown(cancel_futures=True)
+                    break
+                try:
+                    f.result()
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{Path(futures[f]['src']).name}: {e}")
+                done += 1
+                self.progress.emit(done, len(self.jobs))
+        self.finished_all.emit(done - len(errors), errors)
+
+
+# ---------------------------------------------------------------- главное окно
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Mini LightRoom")
+        self.resize(1500, 900)
+        self.folder: Path | None = None
+        self.files: list[Path] = []
+        self.items: dict[str, QListWidgetItem] = {}
+        self.sidecar: dict[str, dict] = {}
+        self.scores: dict[str, float] = {}
+        self.blurry: set[str] = set()
+        self.current: Path | None = None
+        self.base: np.ndarray | None = None
+        self.before: QImage | None = None
+        self.after: QImage | None = None
+        self.params = E.default_params()
+        self.clipboard: dict | None = None
+        self.cache: dict[Path, tuple] = {}  # превью и полный размер
+        self.gen = 0
+        self.rendering = False
+        self.dirty = False
+        self.full: np.ndarray | None = None       # полное разрешение текущего кадра (для масштаба)
+        self.full_path: Path | None = None
+        self.full_loading: Path | None = None
+        self.detail_gen = 0
+        self.detail_busy = False
+        self.detail_dirty = False
+        self.detail_pair: tuple | None = None     # (до, после, место в кадре)
+        self.detail_timer = QTimer(self, singleShot=True, interval=150, timeout=self.request_detail)
+        self.export_thread: ExportThread | None = None
+        self.thumb_pool = QThreadPool()
+        self.thumb_pool.setMaxThreadCount(2)
+        STYLES_DIR.mkdir(exist_ok=True)
+        PRESETS_DIR.mkdir(exist_ok=True)
+
+        self._build_toolbar()
+        self._build_body()
+        self._build_status()
+        self.reload_styles()
+        self.reload_presets()
+        self._set_enabled(False)
+
+    # ---------- построение интерфейса
+
+    def _action(self, text, slot, shortcut=None, tip=""):
+        a = QAction(text, self)
+        a.triggered.connect(slot)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        a.setToolTip(f"{tip or text} ({shortcut})" if shortcut else (tip or text))
+        self.addAction(a)
+        return a
+
+    def _build_toolbar(self):
+        tb = QToolBar()
+        tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.addToolBar(tb)
+        tb.addAction(self._action("📂  Открыть папку", self.open_folder, "Ctrl+O"))
+        tb.addSeparator()
+        self.a_auto = self._action("✨ Авто", self.apply_auto, "A", "Подобрать тон и баланс белого под кадр")
+        self.a_reset = self._action("↺ Сброс", self.reset_all, "Ctrl+R", "Сбросить все правки кадра")
+        self.a_compare = self._action("◐ До / после", self.toggle_compare, "\\", "Показать исходник")
+        self.a_compare.setCheckable(True)
+        self.a_copy = self._action("Копировать правки", self.copy_settings, "Ctrl+C")
+        self.a_paste = self._action("Вставить в выделенные", self.paste_settings, "Ctrl+V")
+        for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste):
+            tb.addAction(a)
+        tb.addSeparator()
+        self.auto_on_open = QCheckBox("Авто для новых кадров")
+        self.auto_on_open.setChecked(True)
+        self.auto_on_open.setToolTip("Кадр без правок при открытии сразу получает «Авто»")
+        tb.addWidget(self.auto_on_open)
+        tb.addSeparator()
+        self.a_zoom_out = self._action("−", lambda: self.view.step_zoom(-1), "Ctrl+-", "Уменьшить масштаб")
+        self.a_zoom_in = self._action("+", lambda: self.view.step_zoom(1), "Ctrl+=", "Увеличить масштаб")
+        self.a_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
+        self.a_fit = self._action("Вписать", lambda: self.view.set_zoom(None), "Ctrl+0")
+        self.a_100 = self._action("100%", lambda: self.view.set_zoom(1.0), "Ctrl+1")
+        self.zoom_combo = QComboBox()
+        self.zoom_combo.addItem("Вписать")
+        self.zoom_combo.addItems([f"{round(z * 100)}%" for z in ZOOM_STEPS])
+        self.zoom_combo.setToolTip("Масштаб от полного разрешения снимка.\nКолёсико — приблизить к курсору, "
+                                   "перетаскивание — сдвиг,\nдвойной щелчок — 100% / вписать")
+        self.zoom_combo.activated.connect(
+            lambda i: self.view.set_zoom(None if i == 0 else ZOOM_STEPS[i - 1]))
+        tb.addAction(self.a_zoom_out)
+        tb.addWidget(self.zoom_combo)
+        tb.addAction(self.a_zoom_in)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+        self.a_export = self._action("⬇  Экспорт…", self.export, "Ctrl+E")
+        tb.addAction(self.a_export)
+
+    def _build_body(self):
+        self.strip = QListWidget()
+        self.strip.setViewMode(QListWidget.ListMode)
+        self.strip.setIconSize(QSize(160, 110))
+        self.strip.setSelectionMode(QListWidget.ExtendedSelection)
+        self.strip.setMinimumWidth(230)
+        self.strip.currentItemChanged.connect(self.on_select)
+
+        self.view = ImageView()
+        self.view.view_changed.connect(self.on_view_changed)
+
+        panel = QWidget()
+        pl = QVBoxLayout(panel)
+        self.hist = Histogram()
+        pl.addWidget(self.hist)
+        self.rows: dict[str, SliderRow] = {}
+        groups: dict[str, QVBoxLayout] = {}
+        for key, label, lo, hi, group in E.SLIDERS:
+            if group not in groups:
+                box = QGroupBox(group)
+                groups[group] = QVBoxLayout(box)
+                pl.addWidget(box)
+            row = SliderRow(key, label, lo, hi)
+            row.changed.connect(self.on_param)
+            groups[group].addWidget(row)
+            self.rows[key] = row
+
+        # Стиль с чужого фото
+        box = QGroupBox("Стиль с референса")
+        sl = QVBoxLayout(box)
+        self.style_combo = QComboBox()
+        self.style_combo.currentIndexChanged.connect(self.on_style)
+        sl.addWidget(self.style_combo)
+        b = QPushButton("＋ Новый стиль из фото…")
+        b.setToolTip("Выберите чужой снимок, цвета и настроение которого нравятся")
+        b.clicked.connect(self.new_style)
+        sl.addWidget(b)
+        self.rows["style_strength"] = SliderRow("style_strength", "Сила стиля", 0, 100)
+        self.rows["style_strength"].changed.connect(self.on_param)
+        sl.addWidget(self.rows["style_strength"])
+        b = QPushButton("Сохранить как LUT (.cube)…")
+        b.setToolTip("Цвет и стиль в файле .cube для Lightroom, DaVinci или телефона")
+        b.clicked.connect(self.export_lut)
+        sl.addWidget(b)
+        pl.addWidget(box)
+
+        # Пресеты
+        box = QGroupBox("Пресеты")
+        prl = QHBoxLayout(box)
+        self.preset_combo = QComboBox()
+        self.preset_combo.activated.connect(self.apply_preset)
+        prl.addWidget(self.preset_combo, 1)
+        b = QPushButton("Сохранить")
+        b.clicked.connect(self.save_preset)
+        prl.addWidget(b)
+        pl.addWidget(box)
+        pl.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(300)
+        self.panel = panel
+
+        split = QSplitter()
+        split.addWidget(self.strip)
+        split.addWidget(self.view)
+        split.addWidget(scroll)
+        split.setStretchFactor(1, 1)
+        split.setSizes([240, 950, 320])
+        self.setCentralWidget(split)
+
+    def _build_status(self):
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(260)
+        self.progress.hide()
+        self.cancel_btn = QPushButton("Остановить")
+        self.cancel_btn.hide()
+        self.cancel_btn.clicked.connect(self.cancel_export)
+        self.statusBar().addPermanentWidget(self.progress)
+        self.statusBar().addPermanentWidget(self.cancel_btn)
+
+    def _set_enabled(self, on):
+        self.panel.setEnabled(on)
+        for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_export,
+                  self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100):
+            a.setEnabled(on)
+        self.zoom_combo.setEnabled(on)
+
+    def toast(self, text, ms=4000):
+        self.statusBar().showMessage(text, ms)
+
+    # ---------- папка и миниатюры
+
+    def open_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Папка со снимками", str(self.folder or Path.home()))
+        if d:
+            self.load_folder(Path(d))
+
+    def load_folder(self, folder: Path):
+        self.save_sidecar()
+        self.folder = folder
+        self.files = sorted(p for p in folder.iterdir() if p.suffix.lower() in E.PHOTO_EXT)
+        self.sidecar = E.read_json(folder / SIDECAR, {})
+        self.scores.clear()
+        self.blurry.clear()
+        self.items.clear()
+        self.cache.clear()
+        self.current = None
+        self.strip.clear()
+        self.setWindowTitle(f"Mini LightRoom — {folder}")
+        if not self.files:
+            self.view.set_image(None)
+            self.view.message = "В этой папке нет снимков (ARW, DNG, NEF, CR3, JPEG…)\nОткройте другую папку"
+            self.view.update()
+            self._set_enabled(False)
+            return
+        placeholder = QPixmap(160, 106)
+        placeholder.fill(QColor("#2a2a2a"))
+        for p in self.files:
+            it = QListWidgetItem(QIcon(placeholder), p.name)
+            it.setData(PATH_ROLE, str(p))
+            self.strip.addItem(it)
+            self.items[p.name] = it
+            run_task(thumb_job, p, done=self.on_thumb, pool=self.thumb_pool)
+        self.toast(f"Снимков в папке: {len(self.files)}. Проверяю резкость…")
+        self.strip.setCurrentRow(0)
+
+    def on_thumb(self, res):
+        path, th, score = res
+        it = self.items.get(Path(path).name)
+        if it is None:
+            return
+        it.setIcon(QIcon(QPixmap.fromImage(to_qimage(th))))
+        self.scores[Path(path).name] = score
+        if len(self.scores) == len(self.files) and len(self.files) >= 3:
+            med = statistics.median(self.scores.values())
+            self.blurry = {n for n, s in self.scores.items() if s < med * 0.3}
+            for n, item in self.items.items():
+                if n in self.blurry:
+                    item.setText(f"⚠ {n}\nвозможно, размыт")
+                    item.setForeground(QColor("#ff9b73"))
+            self.toast(f"Резкость проверена: подозрительно размытых {len(self.blurry)}")
+
+    # ---------- выбор кадра
+
+    def on_select(self, item, _prev=None):
+        if item is None:
+            return
+        self.store_current()
+        self.current = Path(item.data(PATH_ROLE))
+        self.base = None
+        self.full = self.full_path = None
+        self.view.message = "Проявляю RAW…"
+        self.view.badge = ""
+        self.view.update()
+        if self.current in self.cache:
+            self.on_preview((self.current, *self.cache[self.current]))
+        else:
+            run_task(preview_job, self.current, done=self.on_preview, fail=self.on_error)
+
+    def on_preview(self, res):
+        path, img, size = res
+        self.cache[path] = (img, size)
+        if len(self.cache) > 6:
+            self.cache.pop(next(iter(self.cache)))
+        if path != self.current:
+            return
+        self.base = img
+        self.view.set_source_size(*size)
+        self.before = to_qimage(to_u8(img))
+        saved = self.sidecar.get(path.name)
+        self.params = {**E.default_params(), **saved} if saved else E.default_params()
+        if not saved and self.auto_on_open.isChecked():
+            self.params.update(E.auto_params(img))
+        self.sync_controls()
+        self._set_enabled(True)
+        self.view.message = ""
+        self.request_render()
+
+    def on_error(self, msg):
+        self.view.message = f"Не получилось открыть кадр:\n{msg}"
+        self.view.set_image(None)
+        self.toast("Ошибка чтения файла — выберите другой кадр", 8000)
+
+    def store_current(self):
+        if self.current is not None and self.base is not None:
+            self.sidecar[self.current.name] = dict(self.params)
+
+    def save_sidecar(self):
+        self.store_current()
+        if self.folder and self.sidecar:
+            try:
+                E.write_json(self.folder / SIDECAR, self.sidecar)
+            except OSError as e:
+                self.toast(f"Не удалось сохранить правки: {e}", 8000)
+
+    # ---------- правки и рендер
+
+    def sync_controls(self):
+        for key, row in self.rows.items():
+            row.set_value(self.params.get(key, 0))
+        self.style_combo.blockSignals(True)
+        idx = self.style_combo.findText(self.params.get("style") or "— без стиля —")
+        self.style_combo.setCurrentIndex(max(0, idx))
+        self.style_combo.blockSignals(False)
+
+    def on_param(self, key, value):
+        self.params[key] = value
+        self.request_render()
+
+    def current_style(self):
+        name = self.params.get("style")
+        return self.styles.get(name) if name else None
+
+    def request_render(self):
+        self.detail_gen += 1  # деталь с прежними правками больше не годится
+        self.detail_pair = None
+        if self.base is None:
+            return
+        if self.rendering:
+            self.dirty = True
+            return
+        self.rendering = True
+        self.gen += 1
+        run_task(render_job, self.gen, self.base, dict(self.params), self.current_style(),
+                 done=self.on_rendered, fail=self.on_render_fail)
+
+    def on_rendered(self, res):
+        _gen, out, hist = res
+        self.rendering = False
+        self.after = to_qimage(out)
+        self.hist.set_hist(hist)
+        self.show_current()
+        self.detail_timer.start()
+        if self.dirty:
+            self.dirty = False
+            self.request_render()
+
+    def on_render_fail(self, msg):
+        self.rendering = False
+        self.toast(f"Ошибка обработки: {msg}", 8000)
+
+    def show_current(self):
+        before = self.a_compare.isChecked()
+        self.view.badge = "ДО" if before else ""
+        self.view.set_image(self.before if before else self.after)
+        if self.detail_pair:
+            b, a, rect = self.detail_pair
+            self.view.set_detail((b if before else a, rect))
+        else:
+            self.view.set_detail(None)
+
+    # ---------- масштаб
+
+    def on_view_changed(self):
+        v = self.view
+        self.zoom_combo.setItemText(0, f"Вписать ({round(v.fit_scale() * 100)}%)")
+        idx = 0 if v.zoom is None else next((i + 1 for i, z in enumerate(ZOOM_STEPS) if abs(z - v.zoom) < 1e-6), 0)
+        self.zoom_combo.setCurrentIndex(idx)
+        self.detail_timer.start()
+
+    def request_detail(self):
+        """Видимая область в полном разрешении, когда превью растянуто больше своего размера."""
+        v = self.view
+        if self.base is None or v.scale() * v.src_w <= self.base.shape[1] * 1.05:
+            return
+        if self.full_path != self.current:
+            if self.full_loading != self.current:
+                self.full_loading = self.current
+                self.toast("Загружаю полное разрешение для просмотра в масштабе…", 0)
+                run_task(full_job, self.current, done=self.on_full, fail=self.on_full_fail)
+            return
+        if self.detail_busy:
+            self.detail_dirty = True
+            return
+        r = v.visible_rect()
+        h, w = self.full.shape[:2]
+        rect = (max(0, int(r.left())), max(0, int(r.top())),
+                min(w, int(np.ceil(r.right()))), min(h, int(np.ceil(r.bottom()))))
+        if rect[2] <= rect[0] or rect[3] <= rect[1]:
+            return
+        self.detail_busy = True
+        run_task(detail_job, self.detail_gen, self.full, self.base, rect, min(1.0, v.scale()),
+                 dict(self.params), self.current_style(), done=self.on_detail, fail=self.on_detail_fail)
+
+    def on_full(self, res):
+        path, img = res
+        if self.full_loading == path:
+            self.full_loading = None
+        if path != self.current:
+            return
+        self.full, self.full_path = img, path
+        h, w = img.shape[:2]
+        v = self.view
+        if (w, h) != (v.src_w, v.src_h):  # размер из заголовка RAW может чуть отличаться
+            v.cx, v.cy = v.cx * w / v.src_w, v.cy * h / v.src_h
+            v.src_w, v.src_h = w, h
+        self.toast("Полное разрешение загружено", 2000)
+        self.request_detail()
+
+    def on_full_fail(self, msg):
+        self.full_loading = None
+        self.toast(f"Не удалось загрузить полное разрешение: {msg}", 8000)
+
+    def on_detail(self, res):
+        gen, (x0, y0, x1, y1), before, after = res
+        self.detail_busy = False
+        if gen == self.detail_gen and self.full_path == self.current:
+            self.detail_pair = (QPixmap.fromImage(to_qimage(before)), QPixmap.fromImage(to_qimage(after)),
+                                QRectF(x0, y0, x1 - x0, y1 - y0))
+            self.show_current()
+        if self.detail_dirty:
+            self.detail_dirty = False
+            self.request_detail()
+
+    def on_detail_fail(self, msg):
+        self.detail_busy = False
+        self.toast(f"Ошибка обработки в масштабе: {msg}", 8000)
+
+    def toggle_compare(self):
+        self.show_current()
+
+    def apply_auto(self):
+        if self.base is None:
+            return
+        self.params.update(E.auto_params(self.base))
+        self.sync_controls()
+        self.request_render()
+        self.toast("Авто: тон и баланс белого подобраны под кадр")
+
+    def reset_all(self):
+        self.params = E.default_params()
+        self.sync_controls()
+        self.request_render()
+        self.toast("Правки сброшены")
+
+    def copy_settings(self):
+        self.clipboard = dict(self.params)
+        self.toast("Правки скопированы. Выделите кадры (Ctrl/Shift+щелчок) и нажмите Ctrl+V")
+
+    def paste_settings(self):
+        if not self.clipboard:
+            self.toast("Сначала скопируйте правки (Ctrl+C)")
+            return
+        items = self.strip.selectedItems()
+        for it in items:
+            self.sidecar[Path(it.data(PATH_ROLE)).name] = dict(self.clipboard)
+        if self.current and self.current.name in {Path(i.data(PATH_ROLE)).name for i in items}:
+            self.params = dict(self.clipboard)
+            self.sync_controls()
+            self.request_render()
+        self.save_sidecar()
+        self.toast(f"Правки вставлены в кадров: {len(items)}")
+
+    # ---------- стили
+
+    def reload_styles(self, select: str | None = None):
+        self.styles = {}
+        for f in sorted(STYLES_DIR.glob("*.json")):
+            s = E.read_json(f, None)
+            if s and "mean" in s:
+                self.styles[s.get("name", f.stem)] = s
+        self.style_combo.blockSignals(True)
+        self.style_combo.clear()
+        self.style_combo.addItem("— без стиля —")
+        self.style_combo.addItems(list(self.styles))
+        if select:
+            self.style_combo.setCurrentText(select)
+        self.style_combo.blockSignals(False)
+
+    def on_style(self, idx):
+        self.params["style"] = self.style_combo.currentText() if idx > 0 else ""
+        self.request_render()
+
+    def new_style(self):
+        exts = " ".join(f"*{e}" for e in sorted(E.PHOTO_EXT))
+        path, _ = QFileDialog.getOpenFileName(self, "Фото-референс", str(self.folder or Path.home()),
+                                              f"Снимки ({exts})")
+        if not path:
+            return
+        name, ok = QInputDialog.getText(self, "Новый стиль", "Название стиля:", text=Path(path).stem)
+        name = name.strip()
+        if not ok or not name:
+            return
+        self.toast("Анализирую цвета референса…", 0)
+
+        def done(style):
+            safe = "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in name)
+            E.write_json(STYLES_DIR / f"{safe}.json", style)
+            self.reload_styles(select=name)
+            self.params["style"] = name
+            self.request_render()
+            self.toast(f"Стиль «{name}» сохранён и применён. Силу регулирует ползунок ниже")
+
+        run_task(E.style_from_image, path, name, done=done,
+                 fail=lambda m: self.toast(f"Не удалось прочитать референс: {m}", 8000))
+
+    def export_lut(self):
+        if self.base is None:
+            return
+        name = self.params.get("style") or "мой_цвет"
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить LUT", str(APP_DIR / f"{name}.cube"),
+                                              "3D LUT (*.cube)")
+        if not path:
+            return
+        no_style = {**self.params, "style": ""}
+        src = E.lab_stats(E.process(self.base, no_style, None, local=False))
+        E.export_cube(path, self.params, self.current_style(), src)
+        self.toast(f"LUT сохранён: {path}. Света/тени, чёткость и резкость в LUT не входят", 8000)
+
+    # ---------- пресеты
+
+    def reload_presets(self):
+        self.preset_combo.clear()
+        self.preset_combo.addItem("— выбрать пресет —")
+        self.preset_combo.addItems([f.stem for f in sorted(PRESETS_DIR.glob("*.json"))])
+
+    def apply_preset(self, idx):
+        if idx <= 0 or self.base is None:
+            return
+        name = self.preset_combo.currentText()
+        self.params = {**E.default_params(), **E.read_json(PRESETS_DIR / f"{name}.json", {})}
+        self.sync_controls()
+        self.request_render()
+        self.preset_combo.setCurrentIndex(0)
+        self.toast(f"Пресет «{name}» применён")
+
+    def save_preset(self):
+        name, ok = QInputDialog.getText(self, "Сохранить пресет", "Название пресета:")
+        name = "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in name.strip())
+        if ok and name:
+            E.write_json(PRESETS_DIR / f"{name}.json", self.params)
+            self.reload_presets()
+            self.toast(f"Пресет «{name}» сохранён")
+
+    # ---------- экспорт
+
+    def export(self):
+        if self.export_thread or not self.files:
+            return
+        self.store_current()
+        selected = [Path(i.data(PATH_ROLE)) for i in self.strip.selectedItems()]
+        dlg = ExportDialog(self, len(selected), len(self.files), self.folder)
+        if not dlg.exec():
+            return
+        if dlg.r_all.isChecked():
+            paths = list(self.files)
+        elif dlg.r_selected.isChecked():
+            paths = selected
+        else:
+            paths = [self.current]
+        if dlg.skip_blur.isChecked():
+            paths = [p for p in paths if p.name not in self.blurry]
+        if not paths:
+            self.toast("Нечего экспортировать: все выбранные кадры отмечены как размытые")
+            return
+        out_dir = Path(dlg.out.text())
+        jobs = []
+        for p in paths:
+            params = self.sidecar.get(p.name, self.params)
+            jobs.append({"src": str(p), "dst": str(out_dir / f"{p.stem}.jpg"), "params": params,
+                         "style": self.styles.get(params.get("style") or ""),
+                         "auto": dlg.auto.isChecked(), "long_edge": dlg.edge.value(),
+                         "quality": dlg.quality.value()})
+        self.save_sidecar()
+        self.export_dir = out_dir
+        self.progress.setRange(0, len(jobs))
+        self.progress.setValue(0)
+        self.progress.setFormat("Экспорт %v из %m")
+        self.progress.show()
+        self.cancel_btn.show()
+        self.a_export.setEnabled(False)
+        self.export_thread = ExportThread(jobs)
+        self.export_thread.progress.connect(lambda d, n: self.progress.setValue(d))
+        self.export_thread.finished_all.connect(self.on_export_done)
+        self.export_thread.start()
+
+    def cancel_export(self):
+        if self.export_thread:
+            self.export_thread.stop = True
+            self.cancel_btn.setEnabled(False)
+            self.toast("Останавливаю после текущих кадров…", 0)
+
+    def on_export_done(self, ok, errors):
+        self.export_thread.wait()
+        self.export_thread = None
+        self.progress.hide()
+        self.cancel_btn.hide()
+        self.cancel_btn.setEnabled(True)
+        self.a_export.setEnabled(True)
+        if errors:
+            QMessageBox.warning(self, "Экспорт завершён с ошибками",
+                                f"Готово: {ok}. Ошибки:\n" + "\n".join(errors[:15]))
+        box = QMessageBox(self)
+        box.setWindowTitle("Экспорт готов")
+        box.setText(f"Сохранено снимков: {ok}\n{self.export_dir}")
+        open_btn = box.addButton("Открыть папку", QMessageBox.AcceptRole)
+        box.addButton("Закрыть", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.export_dir)))
+
+    def closeEvent(self, e):
+        self.save_sidecar()
+        if self.export_thread:
+            self.export_thread.stop = True
+            self.export_thread.wait()
+        super().closeEvent(e)
+
+
+def apply_dark_theme(app: QApplication):
+    app.setStyle("Fusion")
+    pal = QPalette()
+    for role, color in [(QPalette.Window, "#232323"), (QPalette.WindowText, "#e6e6e6"),
+                        (QPalette.Base, "#1c1c1c"), (QPalette.AlternateBase, "#262626"),
+                        (QPalette.Text, "#e6e6e6"), (QPalette.Button, "#2e2e2e"),
+                        (QPalette.ButtonText, "#e6e6e6"), (QPalette.Highlight, "#3d7eff"),
+                        (QPalette.HighlightedText, "#ffffff"), (QPalette.ToolTipBase, "#2e2e2e"),
+                        (QPalette.ToolTipText, "#e6e6e6")]:
+        pal.setColor(role, QColor(color))
+    pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor("#6a6a6a"))
+    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor("#6a6a6a"))
+    pal.setColor(QPalette.Disabled, QPalette.Text, QColor("#6a6a6a"))
+    app.setPalette(pal)
+    app.setStyleSheet("""
+        QGroupBox { border: 1px solid #333; border-radius: 6px; margin-top: 14px; padding: 8px 8px 4px; }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; color: #bdbdbd; }
+        QToolBar { spacing: 4px; padding: 4px; border: none; }
+        QToolButton { padding: 5px 10px; border-radius: 5px; }
+        QToolButton:hover { background: #353535; }
+        QToolButton:checked { background: #3d7eff; }
+        QListWidget { border: none; }
+        QListWidget::item { padding: 4px; }
+        QPushButton { padding: 5px 10px; }
+    """)
