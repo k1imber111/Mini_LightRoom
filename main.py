@@ -12,15 +12,20 @@ from PySide6.QtWidgets import QApplication
 from mini_lightroom.ui import MainWindow, apply_dark_theme
 
 LOGS = Path(__file__).resolve().parent / "logs"
+RUN_LOG = LOGS / "crash_current.log"  # журнал этого запуска: при нормальном выходе удаляется
 _crash_log = None  # файл держим открытым: faulthandler пишет в него при аварийном падении
 
 
 def watch_hangs(app: QApplication) -> None:
-    """Падения и зависания — в logs/: стеки всех потоков показывают, на чём именно встало."""
+    """Падения и зависания — в logs/: стеки всех потоков показывают, на чём именно встало.
+    faulthandler в Windows пишет и безобидные исключения (COM 0x8001010d), поэтому журнал запуска
+    оставляем, только если программа не дошла до нормального выхода: тогда он — crash_<время>.log."""
     global _crash_log
     try:
         LOGS.mkdir(exist_ok=True)
-        _crash_log = open(LOGS / "crash.log", "a", encoding="utf-8")  # noqa: SIM115
+        if RUN_LOG.exists() and RUN_LOG.stat().st_size:  # прошлый запуск оборвался — сохранить его журнал
+            RUN_LOG.replace(LOGS / time.strftime("crash_%Y-%m-%d_%H-%M-%S.log", time.localtime(RUN_LOG.stat().st_mtime)))
+        _crash_log = open(RUN_LOG, "w", encoding="utf-8")  # noqa: SIM115
     except OSError:
         return  # папка программы только для чтения — без журнала
     faulthandler.enable(_crash_log, all_threads=True)
@@ -54,7 +59,12 @@ def main():
         win.load_folder(Path(sys.argv[1]))
     else:
         win.restore_session()  # последняя папка на последнем кадре — продолжаем, где остановились
-    sys.exit(app.exec())
+    code = app.exec()
+    if _crash_log is not None:  # дошли до нормального выхода — записи журнала были безобидными
+        faulthandler.disable()
+        _crash_log.close()
+        RUN_LOG.unlink(missing_ok=True)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
