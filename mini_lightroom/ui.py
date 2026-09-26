@@ -71,6 +71,7 @@ from . import enhance as N
 from . import masks as MK
 from . import scene as S
 from . import segment as G
+from .crop_editor import CropEditor
 from .mask_editor import MaskEditor
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -84,6 +85,9 @@ SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат 
 MASKS_DIR = ".mini_lightroom_masks"  # ИИ-маски кадров (PNG) рядом со снимками
 PREVIEW_SIDE = 1400
 PATH_ROLE = Qt.UserRole
+# Пропорции обрезки: подпись → ширина/высота; "cam" — как снимала камера, "orig" — как у RAW.
+ASPECTS = [("Свободно", None), ("Как в камере", "cam"), ("Исходное", "orig"), ("1:1", 1.0), ("4:5", 0.8),
+           ("3:2", 1.5), ("4:3", 4 / 3), ("16:9", 16 / 9)]
 ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 7, 10, 16]  # 1 = 100% (пиксель снимка = пиксель экрана)
 
 
@@ -124,6 +128,14 @@ def run_task(fn, *args, done=None, fail=None, pool: QThreadPool | None = None):
     (pool or QThreadPool.globalInstance()).start(t)
 
 
+def aspect_label(a: float) -> str:
+    """1.777 → «16:9»: подпись пропорции для людей."""
+    for w, h in ((16, 9), (3, 2), (4, 3), (1, 1), (5, 4), (4, 5), (9, 16), (2, 3), (3, 4)):
+        if abs(a - w / h) < 0.01:
+            return f"{w}:{h}"
+    return f"{a:.2f}:1"
+
+
 def to_qimage(rgb_u8: np.ndarray) -> QImage:
     a = np.ascontiguousarray(rgb_u8)
     h, w = a.shape[:2]
@@ -140,7 +152,8 @@ def thumb_job(path):
 
 
 def preview_job(path):
-    return path, E.load_image(path, half=True, max_side=PREVIEW_SIDE), E.full_size(path), N.iso_of(path)
+    return (path, E.load_image(path, half=True, max_side=PREVIEW_SIDE), E.full_size(path), N.iso_of(path),
+            E.camera_aspect(path))
 
 
 def denoise_job(path, base):
@@ -211,14 +224,18 @@ def detail_job(gen, full, base, rect, scale, params, style, look):
     src_stats = E.style_source_stats(base, params) if style else None  # стиль — как у всего кадра
     s = params.get("denoise", 0) / 100
     prep = (lambda c, box: _denoise_box(c, box, s)) if s > 0 and N.available() else None
-    before, after = E.process_region(full, rect, scale, params, style, src_stats, look, prep)
+    before, after = E.process_view_region(full, rect, scale, params, style, src_stats, look, prep)
     return gen, rect, to_u8(before), to_u8(after)
 
 
-def render_job(gen, base, params, style, look, dn=None):
+def render_job(gen, base, params, style, look, dn=None, geo=None):
     if dn is not None:  # превью без шума готово — смешиваем по силе шумодава
         base = base + (dn - base) * (params.get("denoise", 0) / 100)
-    out = to_u8(E.process(base, params, style, look=look))
+    out = E.process(base, params, style, look=look)
+    if geo:  # обрезка и горизонт — последним шагом; гистограмма уже по обрезанному кадру
+        crop, angle, full = geo
+        out = E.apply_crop(out, crop, angle, full)
+    out = to_u8(out)
     hist = [np.histogram(out[..., c], bins=64, range=(0, 256))[0] for c in range(3)]
     return gen, out, hist
 
@@ -241,7 +258,11 @@ class ImageView(QWidget):
         self._drag = None
         self.message = "Откройте папку со снимками\nCtrl+O или кнопка «Открыть папку»"
         self.badge = ""
-        self.editor = None  # MaskEditor: забирает левую кнопку, когда выбрана маска
+        self.editor = None  # MaskEditor / CropEditor: забирает левую кнопку
+        # Обрезка: A — полный кадр (пиксели) → показанный кадр; src_w×src_h — размер показанного кадра.
+        self.A = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+        self.Ainv = self.A.copy()
+        self.full_w, self.full_h = 1, 1
         self.setMinimumSize(400, 300)
         self.setMouseTracking(True)
 
@@ -254,9 +275,19 @@ class ImageView(QWidget):
         self.update()
 
     def set_source_size(self, w: int, h: int):
-        self.src_w, self.src_h = max(1, w), max(1, h)
-        self.cx, self.cy = w / 2, h / 2
-        self.detail = None
+        self.src_w = self.src_h = 0  # размер «изменился» — центр встанет посередине
+        self.set_geometry(np.array([[1.0, 0, 0], [0, 1.0, 0]]), (w, h), (w, h))
+
+    def set_geometry(self, A, full: tuple, out: tuple):
+        """Показанный кадр = полный кадр после поворота и обрезки (матрица A)."""
+        self.A = np.asarray(A, np.float64)
+        self.Ainv = cv2.invertAffineTransform(self.A)
+        self.full_w, self.full_h = max(1, full[0]), max(1, full[1])
+        ow, oh = max(1.0, float(out[0])), max(1.0, float(out[1]))
+        if abs(ow - self.src_w) > 0.5 or abs(oh - self.src_h) > 0.5:
+            self.src_w, self.src_h = ow, oh
+            self.cx, self.cy = ow / 2, oh / 2
+            self.detail = None
         self._clamp()
         self.update()
 
@@ -281,15 +312,16 @@ class ImageView(QWidget):
                       r.width() * s, r.height() * s)
 
     def to_norm(self, pos: QPointF) -> tuple[float, float]:
-        """Точка виджета → доли полного кадра."""
+        """Точка виджета → доли полного кадра (с учётом обрезки и поворота)."""
         s = self.scale()
-        return ((self.cx + (pos.x() - self.width() / 2) / s) / self.src_w,
-                (self.cy + (pos.y() - self.height() / 2) / s) / self.src_h)
+        ox, oy = self.cx + (pos.x() - self.width() / 2) / s, self.cy + (pos.y() - self.height() / 2) / s
+        fx, fy = self.Ainv @ (ox, oy, 1.0)
+        return fx / self.full_w, fy / self.full_h
 
     def to_widget_pt(self, xn: float, yn: float) -> QPointF:
         s = self.scale()
-        return QPointF(self.width() / 2 + (xn * self.src_w - self.cx) * s,
-                       self.height() / 2 + (yn * self.src_h - self.cy) * s)
+        ox, oy = self.A @ (xn * self.full_w, yn * self.full_h, 1.0)
+        return QPointF(self.width() / 2 + (ox - self.cx) * s, self.height() / 2 + (oy - self.cy) * s)
 
     def visible_rect(self) -> QRectF:
         """Видимая часть кадра в его пикселях."""
@@ -471,6 +503,8 @@ class SliderRow(QWidget):
     def _show(self, v):
         if self.key == "exposure":
             self.value.setText(f"{v / 100:+.2f} EV")
+        elif self.key == "angle_x10":
+            self.value.setText(f"{v / 10:+.1f}°" if v else "0°")
         elif self.key in ("sharpness", "brush_size", "mask_feather") or self.key.startswith(("style_", "look_")):
             self.value.setText(f"{v}")
         else:
@@ -624,7 +658,16 @@ class MainWindow(QMainWindow):
         self.base_dn: np.ndarray | None = None   # превью текущего кадра без шума (полная сила)
         self.dn_busy = False
         self.ai_cache: dict[tuple[str, str], np.ndarray] = {}
-        self.editor = MaskEditor(self.ai_arr_for_layer)
+        self.full_wh: tuple[int, int] = (1, 1)
+        self.cam_aspects: dict[str, float | None] = {}
+        self.crop_mode = False
+        self.crop_backup: dict | None = None
+        self.cropper = CropEditor()
+        self.cropper.changed.connect(self.on_crop_rect)
+        self.history: dict[str, dict] = {}   # {кадр: {"undo": [снимки правок], "redo": [...]}}
+        self.history_timer = QTimer(self, singleShot=True, interval=400, timeout=self.commit_history)
+        self.editor = MaskEditor(self.ai_arr_for_layer,
+                                 (lambda: self.base.shape[:2], lambda m: E.apply_crop(m, *self.display_geo())))
         self.editor.changed.connect(self.on_mask_geom)
         self.editor.created.connect(self.on_mask_created)
         self.thumb_pool = QThreadPool()
@@ -657,6 +700,20 @@ class MainWindow(QMainWindow):
         tb.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.addToolBar(tb)
         tb.addAction(self._action("📂  Открыть папку", self.open_folder, "Ctrl+O"))
+        tb.addSeparator()
+        self.a_undo = self._action("↶", self.undo, "Ctrl+Z", "Отменить")
+        self.a_redo = self._action("↷", self.redo, "Ctrl+Y", "Вернуть")
+        self.a_redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+        tb.addAction(self.a_undo)
+        tb.addAction(self.a_redo)
+        self.a_crop = self._action("✂ Обрезка", self.toggle_crop, "C", "Обрезка и горизонт: рамка на кадре")
+        self.a_crop.setCheckable(True)
+        tb.addAction(self.a_crop)
+        # Enter/Esc включены только в режиме обрезки: иначе они перехватывали бы Enter в полях ввода.
+        self.a_crop_done = self._action("Готово", lambda: self.a_crop.trigger(), "Return")
+        self.a_crop_cancel = self._action("Отменить обрезку", self.cancel_crop, "Esc")
+        self.a_crop_done.setEnabled(False)
+        self.a_crop_cancel.setEnabled(False)
         tb.addSeparator()
         self.a_auto = self._action("✨ Авто", self.apply_auto, "A", "Подобрать тон и баланс белого под кадр")
         self.a_reset = self._action("↺ Сброс", self.reset_all, "Ctrl+R", "Сбросить все правки кадра")
@@ -719,6 +776,37 @@ class MainWindow(QMainWindow):
         pl = QVBoxLayout(panel)
         self.hist = Histogram()
         pl.addWidget(self.hist)
+
+        box = QGroupBox("Обрезка и горизонт")
+        cl = QVBoxLayout(box)
+        row = QHBoxLayout()
+        self.aspect_combo = QComboBox()
+        for label, _ in ASPECTS:
+            self.aspect_combo.addItem(label)
+        self.aspect_combo.setToolTip("Пропорции рамки. «Как в камере» — формат, выбранный в камере (например 16:9)")
+        self.aspect_combo.activated.connect(self.on_aspect)
+        row.addWidget(self.aspect_combo, 1)
+        b = QPushButton("↔")
+        b.setToolTip("Повернуть рамку: горизонтальная ↔ вертикальная")
+        b.setFixedWidth(34)
+        b.clicked.connect(self.flip_aspect)
+        row.addWidget(b)
+        cl.addLayout(row)
+        self.angle_row = SliderRow("angle_x10", "Горизонт", -450, 450)
+        self.angle_row.setToolTip("Поворот для выравнивания горизонта. Рамка сама сжимается, чтобы не было пустых углов")
+        self.angle_row.changed.connect(lambda _k, v: self.on_angle(v / 10))
+        cl.addWidget(self.angle_row)
+        row = QHBoxLayout()
+        self.crop_cam = QCheckBox("Новые кадры — как в камере")
+        self.crop_cam.setChecked(True)
+        self.crop_cam.setToolTip("Если камера снимала в другом формате (например 16:9), новый кадр сразу обрезается так же")
+        row.addWidget(self.crop_cam, 1)
+        b = QPushButton("Сброс")
+        b.setToolTip("Полный кадр без поворота")
+        b.clicked.connect(self.reset_crop)
+        row.addWidget(b)
+        cl.addLayout(row)
+        pl.addWidget(box)
         self.rows: dict[str, SliderRow] = {}
         groups: dict[str, QVBoxLayout] = {}
         for key, label, lo, hi, group in E.SLIDERS:
@@ -907,7 +995,8 @@ class MainWindow(QMainWindow):
     def _set_enabled(self, on):
         self.panel.setEnabled(on)
         for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_export,
-                  self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100, self.a_scenes):
+                  self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100, self.a_scenes,
+                  self.a_undo, self.a_redo, self.a_crop):
             a.setEnabled(on)
         self.zoom_combo.setEnabled(on)
 
@@ -986,6 +1075,10 @@ class MainWindow(QMainWindow):
     def on_select(self, item, _prev=None):
         if item is None:
             return
+        if self.crop_mode:
+            self.a_crop.setChecked(False)
+            self.toggle_crop()
+        self.commit_history()
         self.store_current()
         self.current = Path(item.data(PATH_ROLE))
         self.base = None
@@ -1000,21 +1093,28 @@ class MainWindow(QMainWindow):
             run_task(preview_job, self.current, done=self.on_preview, fail=self.on_error)
 
     def on_preview(self, res):
-        path, img, size, iso = res
-        self.cache[path] = (img, size, iso)
+        path, img, size, iso, cam = res
+        self.cache[path] = (img, size, iso, cam)
         self.isos[path.name] = iso
+        self.cam_aspects[path.name] = cam
         if len(self.cache) > 6:
             self.cache.pop(next(iter(self.cache)))
         if path != self.current:
             return
         self.base = img
+        self.full_wh = size
         self.view.set_source_size(*size)
         self.iso_label.setText(f"ISO {iso}" if iso else "")
-        self.before = to_qimage(to_u8(img))
         saved = self.sidecar.get(path.name)
         self.params = E.normalize_params(saved)
         if not saved and self.auto_on_open.isChecked():
             self.params.update(self.auto_for(path.name, img)[0])
+        if path.name not in self.history:
+            self.history[path.name] = {"undo": [copy.deepcopy(self.params)], "redo": []}
+        if not saved and self.crop_cam.isChecked() and self._cam_differs(path.name):
+            W, H = size
+            self.params["crop"] = E.aspect_crop(W, H, cam)
+            self.toast(f"Кадр обрезан до {aspect_label(cam)}, как снимала камера. Ctrl+Z — полный кадр", 8000)
         self.sync_controls()
         self._set_enabled(True)
         self.view.message = ""
@@ -1046,7 +1146,9 @@ class MainWindow(QMainWindow):
     def sync_controls(self):
         for key, row in self.rows.items():
             row.set_value(self.params.get(key, 0))
+        self.angle_row.set_value(round(self.params.get("angle", 0) * 10))
         self.refresh_mask_list()
+        self.update_geometry()
         for combo, key in ((self.style_combo, "style"), (self.style2_combo, "style2")):
             combo.blockSignals(True)
             combo.setCurrentIndex(max(0, combo.findData(self.params.get(key) or "")))
@@ -1081,6 +1183,7 @@ class MainWindow(QMainWindow):
         self.detail_pair = None
         if self.base is None:
             return
+        self.history_timer.start()  # правки «устоялись» 0.4 с — шаг истории (протяжка = один шаг)
         if self.rendering:
             self.dirty = True
             return
@@ -1090,6 +1193,7 @@ class MainWindow(QMainWindow):
         if self.params.get("denoise") and dn is None:
             self.request_denoise()
         run_task(render_job, self.gen, self.base, self.render_params(), self.current_style(), self.current_look(), dn,
+                 self.display_geo(),
                  done=self.on_rendered, fail=self.on_render_fail)
 
     def on_rendered(self, res):
@@ -1129,7 +1233,7 @@ class MainWindow(QMainWindow):
     def request_detail(self):
         """Видимая область в полном разрешении, когда превью растянуто больше своего размера."""
         v = self.view
-        if self.base is None or v.scale() * v.src_w <= self.base.shape[1] * 1.05:
+        if self.base is None or v.scale() <= self.base.shape[1] / self.full_wh[0] * 1.05:
             return
         if self.full_path != self.current:
             if self.full_loading != self.current:
@@ -1140,15 +1244,16 @@ class MainWindow(QMainWindow):
         if self.detail_busy:
             self.detail_dirty = True
             return
-        r = v.visible_rect()
-        h, w = self.full.shape[:2]
+        r = v.visible_rect()  # в пикселях показанного (обрезанного) кадра
         rect = (max(0, int(r.left())), max(0, int(r.top())),
-                min(w, int(np.ceil(r.right()))), min(h, int(np.ceil(r.bottom()))))
+                min(int(v.src_w), int(np.ceil(r.right()))), min(int(v.src_h), int(np.ceil(r.bottom()))))
         if rect[2] <= rect[0] or rect[3] <= rect[1]:
             return
         self.detail_busy = True
+        rp = self.render_params()
+        rp["crop"] = self.display_geo()[0]
         run_task(detail_job, self.detail_gen, self.full, self.base, rect, min(1.0, v.scale()),
-                 self.render_params(), self.current_style(), self.current_look(), done=self.on_detail, fail=self.on_detail_fail)
+                 rp, self.current_style(), self.current_look(), done=self.on_detail, fail=self.on_detail_fail)
 
     def on_full(self, res):
         path, img = res
@@ -1158,10 +1263,9 @@ class MainWindow(QMainWindow):
             return
         self.full, self.full_path = img, path
         h, w = img.shape[:2]
-        v = self.view
-        if (w, h) != (v.src_w, v.src_h):  # размер из заголовка RAW может чуть отличаться
-            v.cx, v.cy = v.cx * w / v.src_w, v.cy * h / v.src_h
-            v.src_w, v.src_h = w, h
+        if (w, h) != tuple(self.full_wh):  # размер из заголовка RAW может чуть отличаться
+            self.full_wh = (w, h)
+            self.update_geometry()
         self.toast("Полное разрешение загружено", 2000)
         self.request_detail()
 
@@ -1195,6 +1299,194 @@ class MainWindow(QMainWindow):
         self.sync_controls()
         self.request_render()
         self.toast(msg)
+
+    # ---------- история: отмена и повтор
+
+    def _hist(self) -> dict:
+        return self.history.setdefault(self.current.name, {"undo": [], "redo": []})
+
+    def commit_history(self):
+        """Снимок правок кадра, если они изменились с прошлого снимка."""
+        self.history_timer.stop()
+        if self.base is None or self.current is None:
+            return
+        h = self._hist()
+        snap = copy.deepcopy(self.params)
+        if not h["undo"] or h["undo"][-1] != snap:
+            h["undo"].append(snap)
+            h["redo"].clear()
+            del h["undo"][:-100]  # храним последние 100 шагов на кадр
+
+    def _restore(self, snap: dict):
+        self.params = copy.deepcopy(snap)
+        self.editor.set_layer(None)
+        self.sync_controls()
+        self.request_render()
+
+    def undo(self):
+        if self.base is None:
+            return
+        if self.crop_mode:
+            self.a_crop.setChecked(False)
+            self.toggle_crop()
+        self.commit_history()
+        h = self._hist()
+        if len(h["undo"]) < 2:
+            self.toast("Отменять больше нечего")
+            return
+        h["redo"].append(h["undo"].pop())
+        self._restore(h["undo"][-1])
+        self.toast(f"Отменено. Ещё шагов назад: {len(h['undo']) - 1}. Ctrl+Y — вернуть")
+
+    def redo(self):
+        if self.base is None:
+            return
+        self.commit_history()
+        h = self._hist()
+        if not h["redo"]:
+            self.toast("Возвращать нечего")
+            return
+        h["undo"].append(h["redo"].pop())
+        self._restore(h["undo"][-1])
+        self.toast("Возвращено")
+
+    # ---------- обрезка и горизонт
+
+    def display_geo(self) -> tuple:
+        """(обрезка, угол, полный размер) для показа: в режиме обрезки — весь повёрнутый холст."""
+        return (None if self.crop_mode else self.params.get("crop"), self.params.get("angle", 0), self.full_wh)
+
+    def update_geometry(self):
+        if self.base is None:
+            return
+        crop, angle, full = self.display_geo()
+        A, out = E.crop_matrix(*full, crop, angle)
+        self.view.set_geometry(A, full, out)
+        self.before = to_qimage(to_u8(E.apply_crop(self.base, crop, angle, full)))
+        self.editor.invalidate()
+        self.on_view_changed()
+
+    def _cam_differs(self, name: str) -> bool:
+        cam = self.cam_aspects.get(name)
+        W, H = self.full_wh
+        return bool(cam) and abs(np.log(cam / (W / H))) > 0.03
+
+    def _aspect_value(self, idx: int) -> float | None:
+        W, H = self.full_wh
+        a = ASPECTS[idx][1]
+        if a == "cam":
+            a = self.cam_aspects.get(self.current.name) if self.current else None
+            a = a or W / H
+        elif a == "orig":
+            a = W / H
+        if a and H > W and ASPECTS[idx][1] not in ("cam", "orig") and a > 1:
+            a = 1 / a  # вертикальный кадр — вертикальная рамка
+        return a
+
+    def _set_crop(self, rect):
+        full = rect is None or (rect[0] <= 1e-4 and rect[1] <= 1e-4 and rect[2] >= 1 - 1e-4 and rect[3] >= 1 - 1e-4)
+        self.params["crop"] = None if full else [round(v, 5) for v in rect]
+
+    def on_aspect(self, idx: int):
+        if self.base is None:
+            return
+        a = self._aspect_value(idx)
+        self._apply_aspect(a)
+
+    def flip_aspect(self):
+        if self.base is None:
+            return
+        x0, y0, x1, y1 = self.cropper.rect if self.crop_mode else (self.params.get("crop") or (0, 0, 1, 1))
+        W, H = self.full_wh
+        cur = (x1 - x0) * W / ((y1 - y0) * H)
+        self._apply_aspect(1 / cur)
+
+    def _apply_aspect(self, a: float | None):
+        W, H = self.full_wh
+        angle = self.params.get("angle", 0)
+        self.cropper.aspect = a
+        if a is None:
+            self.toast("Пропорции свободные")
+            return
+        x0, y0, x1, y1 = self.cropper.rect if self.crop_mode else (self.params.get("crop") or (0, 0, 1, 1))
+        rect = E.aspect_crop(W, H, a, angle, around=((x0 + x1) / 2, (y0 + y1) / 2))
+        if self.crop_mode:
+            self.cropper.rect = rect
+            self.view.update()
+        self._set_crop(rect)
+        self.update_geometry()
+        self.request_render()
+
+    def on_angle(self, angle: float):
+        if self.base is None:
+            return
+        W, H = self.full_wh
+        self.params["angle"] = angle
+        rect = self.cropper.rect if self.crop_mode else (self.params.get("crop") or [0, 0, 1, 1])
+        a = self.cropper.aspect
+        if a:  # с пропорцией: наибольшая рамка этой пропорции вокруг того же центра
+            rect = E.aspect_crop(W, H, a, angle, around=((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2))
+        else:
+            rect = E.fit_crop(W, H, rect, angle)
+        if self.crop_mode:
+            self.cropper.angle, self.cropper.rect = angle, rect
+        self._set_crop(rect)
+        self.update_geometry()
+        self.request_render()
+
+    def on_crop_rect(self):
+        self._set_crop(self.cropper.rect)
+        self.history_timer.start()
+
+    def toggle_crop(self):
+        if self.base is None:
+            self.a_crop.setChecked(False)
+            return
+        on = self.a_crop.isChecked()
+        if on == self.crop_mode:
+            return
+        if on:
+            self.crop_backup = {k: copy.deepcopy(self.params.get(k)) for k in ("crop", "angle")}
+            W, H = self.full_wh
+            self.cropper.size = (W, H)
+            self.cropper.angle = self.params.get("angle", 0)
+            self.cropper.rect = list(self.params.get("crop") or [0, 0, 1, 1])
+            self.mask_list.setCurrentRow(-1)
+            self.editor.set_layer(None)
+            self.crop_mode = True
+            self.view.editor = self.cropper
+            self.a_crop_done.setEnabled(True)
+            self.a_crop_cancel.setEnabled(True)
+            self.toast("Тяните рамку и её углы; «Горизонт» — поворот. Enter — готово, Esc — отмена", 10000)
+        else:
+            self.crop_mode = False
+            self.view.editor = self.editor
+            self.a_crop_done.setEnabled(False)
+            self.a_crop_cancel.setEnabled(False)
+            self._set_crop(self.cropper.rect)
+            self.toast("Обрезка применена. Ctrl+Z — отменить")
+        self.update_geometry()
+        self.request_render()
+
+    def cancel_crop(self):
+        if not self.crop_mode:
+            return
+        self.params.update(self.crop_backup or {})
+        self.cropper.rect = list(self.params.get("crop") or [0, 0, 1, 1])
+        self.a_crop.setChecked(False)
+        self.toggle_crop()
+        self.angle_row.set_value(round(self.params.get("angle", 0) * 10))
+        self.toast("Обрезка отменена")
+
+    def reset_crop(self):
+        if self.base is None:
+            return
+        self.params["crop"], self.params["angle"] = None, 0.0
+        self.cropper.rect, self.cropper.angle = [0.0, 0.0, 1.0, 1.0], 0.0
+        self.angle_row.set_value(0)
+        self.update_geometry()
+        self.request_render()
+        self.toast("Полный кадр без поворота")
 
     # ---------- шумодав (этап 4)
 
@@ -1286,6 +1578,9 @@ class MainWindow(QMainWindow):
     def add_mask(self, kind: str):
         if self.base is None:
             return
+        if self.crop_mode:
+            self.a_crop.setChecked(False)
+            self.toggle_crop()
         if kind == "brush":
             self.masks().append(MK.new_layer("brush", feather=self.mask_feather_row.slider.value() or 50))
             self.refresh_mask_list(select=len(self.masks()) - 1)
@@ -1471,7 +1766,12 @@ class MainWindow(QMainWindow):
             return
         items = self.strip.selectedItems()
         for it in items:
-            self.sidecar[Path(it.data(PATH_ROLE)).name] = copy.deepcopy(self.clipboard)
+            name = Path(it.data(PATH_ROLE)).name
+            h = self.history.setdefault(
+                name, {"undo": [copy.deepcopy(E.normalize_params(self.sidecar.get(name)))], "redo": []})
+            self.sidecar[name] = copy.deepcopy(self.clipboard)
+            h["undo"].append(copy.deepcopy(self.sidecar[name]))
+            h["redo"].clear()
         if self.current and self.current.name in {Path(i.data(PATH_ROLE)).name for i in items}:
             self.params = self.sidecar[self.current.name]
             self.sync_controls()
@@ -1693,7 +1993,8 @@ class MainWindow(QMainWindow):
         if idx <= 0 or self.base is None:
             return
         name = self.preset_combo.currentText()
-        self.params = E.normalize_params(E.read_json(PRESETS_DIR / f"{name}.json", {}))
+        keep = {k: self.params.get(k) for k in ("crop", "angle")}  # пресет не меняет обрезку
+        self.params = {**E.normalize_params(E.read_json(PRESETS_DIR / f"{name}.json", {})), **keep}
         self.sync_controls()
         self.request_render()
         self.preset_combo.setCurrentIndex(0)
@@ -1703,7 +2004,8 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Сохранить пресет", "Название пресета:")
         name = "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in name.strip())
         if ok and name:
-            E.write_json(PRESETS_DIR / f"{name}.json", self.params)
+            E.write_json(PRESETS_DIR / f"{name}.json",
+                         {k: v for k, v in self.params.items() if k not in ("crop", "angle")})
             self.reload_presets()
             self.toast(f"Пресет «{name}» сохранён")
 

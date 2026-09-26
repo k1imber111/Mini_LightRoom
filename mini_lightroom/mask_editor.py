@@ -22,7 +22,7 @@ class MaskEditor(QObject):
     changed = Signal()          # геометрия слоя изменилась — нужен рендер
     created = Signal(object)    # новый градиент нарисован на кадре (object: Signal(dict) передал бы копию)
 
-    def __init__(self, resolve_arr):
+    def __init__(self, resolve_arr, to_view=None):
         super().__init__()
         self.layer: dict | None = None
         self.creating: str | None = None      # "linear" | "radial": следующий жест создаёт слой
@@ -31,6 +31,7 @@ class MaskEditor(QObject):
         self.erase = False
         self.show_overlay = False
         self._resolve_arr = resolve_arr       # слой ИИ → его маска (uint8) или None
+        self._to_view = to_view               # (h, w) превью полного кадра и перевод маски в вид с обрезкой
         self._drag = None                     # (что тянем, исходная точка, копия геометрии)
         self._stroke: dict | None = None
         self._hover: QPointF | None = None
@@ -125,7 +126,7 @@ class MaskEditor(QObject):
             if lay["type"] == "linear" and math.dist(lay["a"], lay["b"]) < 0.01:
                 lay["b"] = [lay["a"][0], min(1.0, lay["a"][1] + 0.3)]
             if lay["type"] == "radial" and max(lay["r"]) < 0.01:
-                lay["r"] = [0.2, 0.2 * view.src_w / view.src_h]
+                lay["r"] = [0.2, 0.2 * view.full_w / view.full_h]
             self._drag = None
             self._emit()
             return True
@@ -194,7 +195,7 @@ class MaskEditor(QObject):
                 p.drawEllipse(q, HANDLE / 2 + 1, HANDLE / 2 + 1)
             p.setBrush(Qt.NoBrush)
             if lay["type"] == "brush" and self._hover is not None:
-                r = self.brush_size / 1000 * view.src_w * view.scale()
+                r = self.brush_size / 1000 * view.full_w * view.scale()  # радиус — доля ширины полного кадра
                 erase = self.erase
                 p.setPen(QPen(QColor(0, 0, 0, 160), 3))
                 p.drawEllipse(self._hover, r, r)
@@ -206,10 +207,13 @@ class MaskEditor(QObject):
             lay = dict(self.layer)
             if lay["type"] == "ai":
                 lay["arr"] = self._resolve_arr(lay)
-            h, w = view.pix.height(), view.pix.width()
-            m = M.layer_mask(lay, h, w)
+            h, w = self._to_view[0]() if self._to_view else (view.pix.height(), view.pix.width())
+            m = M.layer_mask(lay, h, w)  # маска в координатах полного кадра…
             if m is None:
                 return None
+            if self._to_view:
+                m = self._to_view[1](m)  # …и та же обрезка/поворот, что у показанного кадра
+                h, w = m.shape[:2]
             rgba = np.zeros((h, w, 4), np.uint8)
             rgba[..., 0] = 255
             rgba[..., 3] = (m * 150).astype(np.uint8)

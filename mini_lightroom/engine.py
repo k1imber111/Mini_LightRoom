@@ -46,7 +46,8 @@ def default_params() -> dict:
     # style_mode: 0 — мягкий перенос (среднее и разброс), 1 — точный (распределения L/a/b),
     # style2/style_mix — второй стиль и его доля в смеси.
     p.update(style="", style_strength=70, style_tone=70, style_skin=60, style_mode=0, style2="", style_mix=50,
-             look="", look_strength=100, masks=[])
+             look="", look_strength=100, masks=[],
+             crop=None, angle=0.0)  # обрезка [x0, y0, x1, y1] в долях повёрнутого кадра, поворот в градусах
     return p
 
 
@@ -106,6 +107,16 @@ def full_size(path) -> tuple[int, int]:
 
 
 _FLIP = {3: cv2.ROTATE_180, 5: cv2.ROTATE_90_COUNTERCLOCKWISE, 6: cv2.ROTATE_90_CLOCKWISE}
+
+
+def camera_aspect(path) -> float | None:
+    """Соотношение сторон, в котором снимала камера (по встроенному JPEG; у Sony в режиме 16:9 RAW
+    всё равно полный 3:2). None — не удалось узнать."""
+    try:
+        th = load_thumb(path, 256)
+    except Exception:  # noqa: BLE001 — нет миниатюры: просто без подсказки формата
+        return None
+    return th.shape[1] / th.shape[0]
 
 
 def load_thumb(path, size: int = 512) -> np.ndarray:
@@ -447,6 +458,104 @@ def style_source_stats(img: np.ndarray, p: dict) -> dict:
     return lab_stats(process(img, {**p, "vignette": 0, "sharpness": 0}))
 
 
+# ---------------------------------------------------------------- обрезка и горизонт
+# Последний шаг после всех правок: кадр поворачивается вокруг центра (холст того же размера),
+# затем вырезается crop — прямоугольник в долях повёрнутого холста. Маски и прочие правки живут
+# в координатах полного кадра и об обрезке не знают.
+
+def crop_matrix(W: float, H: float, crop, angle: float) -> tuple[np.ndarray, tuple[float, float]]:
+    """Аффинная матрица 2×3: точка полного кадра (пиксели W×H) → точка результата; и размер результата."""
+    x0, y0, x1, y1 = crop or (0, 0, 1, 1)
+    a = np.radians(angle or 0)
+    R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    c = np.array([W / 2, H / 2])
+    t = c - R @ c - np.array([x0 * W, y0 * H])
+    return np.hstack([R, t[:, None]]), ((x1 - x0) * W, (y1 - y0) * H)
+
+
+def crop_valid(W: float, H: float, crop, angle: float, eps: float = 1e-3) -> bool:
+    """Все углы обрезки лежат на снимке (после поворота по углам холста — пустота)."""
+    x0, y0, x1, y1 = crop
+    if x1 - x0 < 0.01 or y1 - y0 < 0.01:
+        return False
+    a = np.radians(angle or 0)
+    Rinv = np.array([[np.cos(a), np.sin(a)], [-np.sin(a), np.cos(a)]])
+    c = np.array([W / 2, H / 2])
+    pts = np.array([[x0 * W, y0 * H], [x1 * W, y0 * H], [x1 * W, y1 * H], [x0 * W, y1 * H]]) - c
+    src = pts @ Rinv.T + c
+    return bool((src[:, 0] >= -eps * W).all() and (src[:, 0] <= W * (1 + eps)).all()
+                and (src[:, 1] >= -eps * H).all() and (src[:, 1] <= H * (1 + eps)).all())
+
+
+def fit_crop(W: float, H: float, crop, angle: float) -> list[float]:
+    """Сжимает обрезку к её центру, пока она не уляжется на повёрнутый снимок."""
+    x0, y0, x1, y1 = crop
+    if crop_valid(W, H, crop, angle):
+        return list(crop)
+    cx, cy, hw, hh = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+    if not crop_valid(W, H, (cx - 0.005, cy - 0.005, cx + 0.005, cy + 0.005), angle):
+        cx, cy = 0.5, 0.5  # центр вне снимка — начинаем из центра кадра
+    lo, hi = 0.0, 1.0
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        ok = crop_valid(W, H, (cx - hw * mid, cy - hh * mid, cx + hw * mid, cy + hh * mid), angle)
+        lo, hi = (mid, hi) if ok else (lo, mid)
+    return [cx - hw * lo, cy - hh * lo, cx + hw * lo, cy + hh * lo]
+
+
+def aspect_crop(W: float, H: float, aspect: float, angle: float = 0.0, around=None) -> list[float]:
+    """Наибольшая обрезка с соотношением aspect (ширина/высота в пикселях), вписанная в снимок."""
+    cx, cy = around or (0.5, 0.5)
+    if aspect >= W / H:
+        hw, hh = 0.5, 0.5 * (W / aspect) / H
+    else:
+        hw, hh = 0.5 * (H * aspect) / W, 0.5
+    return fit_crop(W, H, [cx - hw, cy - hh, cx + hw, cy + hh], angle)
+
+
+def has_geometry(p: dict) -> bool:
+    return bool(p.get("crop")) or bool(p.get("angle"))
+
+
+def apply_crop(img: np.ndarray, crop, angle: float, full_size=None) -> np.ndarray:
+    """Поворот и обрезка. img может быть уменьшенной копией кадра full_size (превью)."""
+    if not crop and not angle:
+        return img
+    h, w = img.shape[:2]
+    W, H = full_size or (w, h)
+    k = w / W
+    A, (ow, oh) = crop_matrix(W, H, crop, angle)
+    A = A.copy()
+    A[:, 2] *= k  # те же координаты, но в пикселях уменьшенной копии
+    return cv2.warpAffine(img, A.astype(np.float32), (max(1, round(ow * k)), max(1, round(oh * k))),
+                          flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
+def process_view_region(full: np.ndarray, view_rect: tuple, scale: float, p: dict,
+                        style: dict | None = None, src_stats: dict | None = None,
+                        look: dict | None = None, prep=None) -> tuple:
+    """Видимая область обрезанного и повёрнутого кадра (просмотр в масштабе).
+    view_rect=(x0, y0, x1, y1) в пикселях результата (полное разрешение). Обрабатывается охватывающий
+    кусок полного кадра, затем поворачивается и вырезается той же матрицей, что и превью."""
+    H, W = full.shape[:2]
+    A, _ = crop_matrix(W, H, p.get("crop"), p.get("angle", 0))
+    Ainv = cv2.invertAffineTransform(A)
+    vx0, vy0, vx1, vy1 = view_rect
+    corners = np.array([[vx0, vy0, 1], [vx1, vy0, 1], [vx1, vy1, 1], [vx0, vy1, 1]], np.float64) @ Ainv.T
+    bx0, by0 = np.floor(corners.min(0)) - 2
+    bx1, by1 = np.ceil(corners.max(0)) + 2
+    box = (int(max(0, bx0)), int(max(0, by0)), int(min(W, bx1)), int(min(H, by1)))
+    before, after = process_region(full, box, scale, p, style, src_stats, look, prep)
+    if not has_geometry(p):
+        return before, after
+    k = after.shape[1] / (box[2] - box[0])
+    b0 = np.array(box[:2], np.float64)
+    M = np.hstack([A[:, :2], (k * (A[:, :2] @ b0 + A[:, 2] - np.array([vx0, vy0])))[:, None]]).astype(np.float32)
+    size = (max(1, round((vx1 - vx0) * k)), max(1, round((vy1 - vy0) * k)))
+    warp = lambda x: cv2.warpAffine(x, M, size, flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return warp(before), warp(after)
+
+
 def process_region(full: np.ndarray, rect: tuple, scale: float, p: dict,
                    style: dict | None = None, src_stats: dict | None = None,
                    look: dict | None = None, prep=None) -> tuple:
@@ -541,6 +650,7 @@ def export_one(job: dict) -> str:
     elif job.get("auto"):
         params.update(auto_params(img))  # тон — под кадр, стиль и цвет — ваши
     out = process(img, params, job.get("style"), look=job.get("look"))
+    out = apply_crop(out, params.get("crop"), params.get("angle", 0))
     if job.get("long_edge"):
         out = resize_max(out, int(job["long_edge"]))
     if job.get("upscale"):

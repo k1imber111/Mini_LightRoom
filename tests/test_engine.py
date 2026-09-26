@@ -108,6 +108,26 @@ t = time.perf_counter()
 E.process(img, pm)
 print(f"обработка с 4 масками: {(time.perf_counter() - t) * 1000:.0f} мс")
 
+# Обрезка и горизонт: последний шаг, одна матрица для превью, масштаба и экспорта.
+W0, H0 = 1500, 1000
+c169 = E.aspect_crop(W0, H0, 16 / 9)
+assert E.apply_crop(img, c169, 0).shape[:2] == (844, 1500), "16:9 из 3:2"
+assert E.apply_crop(img, None, 0) is img, "без обрезки — без копии"
+rot = E.fit_crop(W0, H0, [0, 0, 1, 1], 5)
+assert E.crop_valid(W0, H0, rot, 5) and not E.crop_valid(W0, H0, [0, 0, 1, 1], 5), "поворот без пустых углов"
+pg = {**E.default_params(), "exposure": 80, "shadows": 60, "clarity": 40, "vignette": -60, "crop": rot, "angle": 5,
+      "masks": [{**MK.new_layer("radial", c=[0.5, 0.5], r=[0.2, 0.3]), "adj": {"exposure": 100}}]}
+shown = E.apply_crop(E.process(img, pg), rot, 5)
+_, vpart = E.process_view_region(img, (300, 200, 700, 500), 1.0, pg)
+dv = np.abs(vpart - shown[200:500, 300:700]).mean()
+print(f"масштаб под обрезкой с поворотом: расхождение {dv:.4f}")
+assert vpart.shape == (300, 400, 3) and dv < 0.01, "увеличенный вид под обрезкой расходится с превью"
+with tempfile.TemporaryDirectory(prefix="обрезка_") as d:
+    E.save_jpeg(Path(d) / "a.jpg", img)
+    E.export_one({"src": str(Path(d) / "a.jpg"), "dst": str(Path(d) / "o.jpg"), "style": None, "auto": False,
+                  "params": {**E.default_params(), "crop": c169}, "long_edge": 0, "quality": 90})
+    assert E.load_image(Path(d) / "o.jpg").shape[:2] == (844, 1500), "экспорт без обрезки"
+
 # Шумодав и увеличение (этап 4).
 from mini_lightroom import enhance as N  # noqa: E402
 

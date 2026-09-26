@@ -150,6 +150,70 @@ if __name__ == "__main__":
         else:
             assert not win.rows["denoise"].isEnabled() or N.available()
 
+        # отмена/повтор: протяжка ползунка — один шаг
+        win.commit_history()
+        steps = len(win._hist()["undo"])
+        for val in range(1, 30):
+            win.rows["clarity"].slider.setValue(val)
+        wait(app, lambda: not win.rendering and not win.dirty)
+        win.commit_history()
+        assert len(win._hist()["undo"]) == steps + 1, "протяжка дала больше одного шага истории"
+        win.undo()
+        assert win.params["clarity"] == 0 and win.rows["clarity"].slider.value() == 0
+        win.redo()
+        assert win.params["clarity"] == 29
+        n_masks = len(win.masks())
+        win.masks().pop()
+        win.request_render()
+        win.commit_history()
+        win.undo()
+        assert len(win.masks()) == n_masks, "удаление маски не отменилось"
+        wait(app, lambda: not win.rendering and not win.dirty)
+
+        # обрезка: пропорции, рамка мышью, горизонт, маски поверх обрезки, масштаб
+        win.a_crop.trigger()
+        assert win.crop_mode and win.view.editor is win.cropper and (win.view.src_w, win.view.src_h) == (900, 600)
+        win.aspect_combo.setCurrentIndex(7)
+        win.on_aspect(7)  # 16:9
+        x0, y0, x1, y1 = win.cropper.rect
+        assert abs((x1 - x0) * 900 / ((y1 - y0) * 600) - 16 / 9) < 0.01
+        win.aspect_combo.setCurrentIndex(0)
+        win.on_aspect(0)  # свободно: тянем правый нижний угол внутрь
+        pc = win.cropper._px(v, x1, y1).toPoint()
+        drag(pc, pc - QPoint(40, 30))
+        assert win.cropper.rect[2] < x1 - 0.02, "угол рамки не сдвинулся"
+        win.angle_row.slider.setValue(35)  # 3.5°
+        assert abs(win.params["angle"] - 3.5) < 1e-6
+        assert E.crop_valid(900, 600, win.cropper.rect, 3.5), "после поворота рамка вышла за снимок"
+        win.a_crop.trigger()  # Enter / повторное нажатие — применить
+        assert not win.crop_mode and win.params["crop"] is not None
+        cw, ch = win.view.src_w, win.view.src_h
+        assert cw < 900 and ch < 600, (cw, ch)
+        wait(app, lambda: not win.rendering and not win.dirty)
+        assert abs(win.after.width() / win.after.height() - cw / ch) < 0.02, "превью не обрезано"
+        pt = v.to_widget_pt(0.37, 0.61)  # маски поверх обрезки: доли полного кадра ↔ экран
+        back = v.to_norm(pt)
+        assert abs(back[0] - 0.37) < 1e-6 and abs(back[1] - 0.61) < 1e-6
+        v.set_zoom(1.0)
+        wait(app, lambda: win.view.detail is not None)
+        dpix, rect = v.detail
+        assert rect.right() <= cw + 1 and rect.bottom() <= ch + 1, "деталь вне обрезанного кадра"
+        v.set_zoom(None)
+        E.write_json(ui.PRESETS_DIR / "__тест_обрезка.json", {"contrast": 10})
+        try:
+            win.reload_presets()
+            i = win.preset_combo.findText("__тест_обрезка")
+            win.preset_combo.setCurrentIndex(i)
+            win.apply_preset(i)
+            assert win.params["crop"] is not None and abs(win.params["angle"] - 3.5) < 1e-6, "пресет сбросил обрезку"
+        finally:
+            (ui.PRESETS_DIR / "__тест_обрезка.json").unlink()
+            win.reload_presets()
+        win.undo()
+        win.reset_crop()
+        assert win.params["crop"] is None and (win.view.src_w, win.view.src_h) == (900, 600)
+        wait(app, lambda: not win.rendering and not win.dirty)
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))
