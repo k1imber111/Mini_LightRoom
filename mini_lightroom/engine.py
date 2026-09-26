@@ -37,7 +37,11 @@ SLIDERS = [
     ("vignette", "Виньетка", -200, 200, "Детали"),
     # Шумодав (ИИ, enhance.py) применяется к исходнику до process(), поэтому process его не трогает.
     ("denoise", "Шумодав", 0, 100, "Детали"),
+    # ИИ-ретушь: пространственные, по маскам ИИ из p["ai_arr"] (готовит окно); без масок — ничего не делают.
+    ("retouch", "Ретушь кожи", 0, 100, "ИИ-ретушь"),
+    ("bokeh", "Размытие фона", 0, 100, "ИИ-ретушь"),
 ]
+AI_SLIDER_CATS = {"retouch": "people", "bokeh": "subject"}  # какая маска ИИ нужна ползунку
 
 
 def default_params() -> dict:
@@ -454,6 +458,13 @@ def process(img: np.ndarray, p: dict, style: dict | None = None,
     if local and layers:  # маски пространственные: в LUT не попадают
         img = apply_masks(np.clip(img, 0, 1), layers, (fw, fh, x0, y0))
 
+    if local:  # ИИ-ретушь — до виньетки и резкости: резкость не должна подчёркивать разглаженное
+        ai = p.get("ai_arr") or {}
+        if g("retouch") > 0 and ai.get("people") is not None:
+            img = skin_smooth(np.clip(img, 0, 1), g("retouch"), ai["people"], (fw, fh, x0, y0))
+        if g("bokeh") > 0 and ai.get("subject") is not None:
+            img = lens_blur(np.clip(img, 0, 1), g("bokeh"), ai["subject"], (fw, fh, x0, y0))
+
     if local:
         v = g("vignette")
         if v:
@@ -486,6 +497,60 @@ def apply_masks(img: np.ndarray, layers: list, frame: tuple) -> np.ndarray:
         local = process(img, {**default_params(), **adj}, frame=frame)
         img = img + (local - img) * m[..., None]
     return img
+
+
+def _ai_mask(arr: np.ndarray, h: int, w: int, frame: tuple) -> np.ndarray:
+    """Маска ИИ всего кадра (uint8) → пиксели этой вырезки (превью, масштаб, полный кадр — одинаково)."""
+    return M.layer_mask({"type": "ai", "arr": arr}, h, w, frame)
+
+
+def _guided(img: np.ndarray, guide: np.ndarray, r: int, eps: float) -> np.ndarray:
+    """Guided filter (He et al.): сглаживает внутри однородных областей, края (глаза, губы) держит.
+    На боксовых фильтрах — время не зависит от радиуса, годится и для 24 Мп."""
+    box = lambda x: cv2.boxFilter(x, -1, (2 * r + 1, 2 * r + 1))
+    mg = box(guide)
+    var = box(guide * guide) - mg * mg
+    out = np.empty_like(img)
+    for c in range(img.shape[2]):
+        p = img[..., c]
+        mp = box(p)
+        a = (box(guide * p) - mg * mp) / (var + eps)
+        out[..., c] = box(a) * guide + box(mp - a * mg)
+    return out
+
+
+def skin_smooth(img: np.ndarray, amount: float, people: np.ndarray, frame: tuple) -> np.ndarray:
+    """Ретушь кожи частотным разложением: пятна и неровности тона (средние частоты) сглаживаются,
+    мелкая текстура пор возвращается — без «пластика». Только кожа людей: маска людей × цвет кожи."""
+    h, w = img.shape[:2]
+    fw = frame[0]
+    m = _ai_mask(people, h, w, frame) * _skin_mask(cv2.cvtColor(img, cv2.COLOR_RGB2Lab))
+    if m.max() < 1e-3:
+        return img
+    fine = img - cv2.GaussianBlur(img, (0, 0), max(0.6, fw / 3000))  # поры и волоски
+    lum = img @ LUM
+    smooth = _guided(img, lum, max(2, round(fw / 120)), 5e-3) + 0.6 * fine  # края контрастнее ~0.07 держатся
+    return img + (smooth - img) * (m * min(amount, 1.0))[..., None]
+
+
+def lens_blur(img: np.ndarray, amount: float, subject: np.ndarray, frame: tuple) -> np.ndarray:
+    """Размытие фона, как у светосильного объектива. Фон размывается только своими пикселями
+    (размытие, нормированное маской фона), поэтому цвет объекта не растекается ореолом за край."""
+    h, w = img.shape[:2]
+    fw = frame[0]
+    sigma = min(amount, 1.0) * 0.012 * fw  # до 1.2% ширины кадра; поля process_region — 5%
+    if sigma < 0.5 or subject.max() < 128:  # объекта нет (пустая маска всего кадра) — размывать нечего
+        return img
+    m = _ai_mask(subject, h, w, frame)
+    bg = 1 - m
+    k = max(1.0, sigma / 6)  # большое размытие — на уменьшенной копии: быстро и на 24 Мп
+    size = (max(1, round(w / k)), max(1, round(h / k)))
+    blur = lambda x: cv2.resize(cv2.GaussianBlur(cv2.resize(x, size, interpolation=cv2.INTER_AREA), (0, 0), sigma / k),
+                                (w, h), interpolation=cv2.INTER_LINEAR)
+    wsum = blur(bg)
+    back = blur(img * bg[..., None]) / np.maximum(wsum, 1e-3)[..., None]
+    back = np.where(wsum[..., None] > 1e-3, back, img)  # глубоко внутри объекта фона нет — там и не нужен
+    return img * m[..., None] + back * bg[..., None]
 
 
 def style_source_stats(img: np.ndarray, p: dict) -> dict:
@@ -610,8 +675,8 @@ def auto_horizon(img: np.ndarray, sky: np.ndarray | None = None) -> float | None
     return 0.0 if abs(tilt) < 0.1 else round(-tilt, 1)  # линия вниз-вправо на a° → повернуть на −a°
 
 
-def saliency_point(img: np.ndarray) -> tuple[float, float]:
-    """Самое заметное место кадра (доли): локальный контраст + насыщенность, лёгкий приоритет центра."""
+def _saliency_map(img: np.ndarray) -> np.ndarray:
+    """Карта заметности на копии 256 px: локальный контраст + насыщенность, лёгкий приоритет центра."""
     small = resize_max(np.clip(img, 0, 1), 256).astype(np.float32)
     h, w = small.shape[:2]
     lab = cv2.cvtColor(small, cv2.COLOR_RGB2Lab)
@@ -620,9 +685,49 @@ def saliency_point(img: np.ndarray) -> tuple[float, float]:
     sat = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)[..., 1] * 30
     yy, xx = np.mgrid[0:h, 0:w]
     prior = np.exp(-(((xx / w - 0.5) ** 2 + (yy / h - 0.5) ** 2) / 0.18))
-    sal = cv2.GaussianBlur((contrast + sat) * (0.6 + 0.4 * prior), (0, 0), 6)
+    return cv2.GaussianBlur((contrast + sat) * (0.6 + 0.4 * prior), (0, 0), 6)
+
+
+def saliency_point(img: np.ndarray) -> tuple[float, float]:
+    """Самое заметное место кадра (доли)."""
+    sal = _saliency_map(img)
+    h, w = sal.shape
+    yy, xx = np.mgrid[0:h, 0:w]
     top = sal >= np.percentile(sal, 97)
     return float(xx[top].mean() / w), float(yy[top].mean() / h)
+
+
+def main_people(people: np.ndarray, min_share: float = 0.015) -> np.ndarray | None:
+    """Главные люди кадра: самый крупный силуэт и сопоставимые с ним (пара, семья) — без толпы за спиной.
+    None — крупного человека нет (прохожие вдали — не объект съёмки)."""
+    m = (people > 0.5).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m)
+    if n < 2:
+        return None
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if areas.max() < min_share * m.size:
+        return None
+    keep = np.isin(lab, 1 + np.nonzero(areas >= areas.max() * 0.4)[0])
+    # мягкий край модели сохраняем: берём исходную вероятность в чуть расширенной области главных
+    grow = cv2.dilate(keep.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    return people * grow
+
+
+def saliency_mask(img: np.ndarray) -> np.ndarray:
+    """Главный объект, когда людей нет: самое заметное пятно кадра (связная область верхних 12%
+    заметности с наибольшей суммой), дыры закрыты. Мягкая маска 0..1 размером с img."""
+    sal = _saliency_map(img)
+    w = sal.shape[1]
+    top = (sal >= np.percentile(sal, 88)).astype(np.uint8)
+    n, lab, _, _ = cv2.connectedComponentsWithStats(top)
+    if n < 2:
+        return np.zeros(img.shape[:2], np.float32)
+    best = 1 + int(np.argmax([sal[lab == i].sum() for i in range(1, n)]))
+    m = (lab == best).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, w // 12) | 1,) * 2)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k).astype(np.float32)
+    m = cv2.GaussianBlur(m, (0, 0), max(1.0, w / 100))
+    return cv2.resize(m, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
 
 
 def subject_point(people: np.ndarray | None) -> tuple[float, float] | None:

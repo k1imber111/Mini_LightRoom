@@ -213,18 +213,34 @@ def _seg_input(base):
     return E.process(base, E.normalize_params(E.auto_params(base)))
 
 
+def _ai_masks(base, cats) -> dict[str, np.ndarray]:
+    """Маски ИИ кадра (uint8). «subject» — главный объект: крупный человек (без толпы за спиной),
+    а если такого нет — самое заметное пятно."""
+    img = _seg_input(base)
+    want = [c for c in cats if c != "subject"]
+    if "subject" in cats and "people" not in want:
+        want.append("people")
+    maps = G.get_segmenter(MODELS_DIR).masks(img, want) if want else {}
+    if "subject" in cats:
+        main = E.main_people(maps["people"])
+        if main is None:
+            main = G.refine(E.saliency_mask(img), img)
+            if main.mean() < 0.02:  # заметное пятно меньше 2% кадра — это не объект съёмки (пейзаж, город)
+                main = np.zeros_like(main)
+        maps["subject"] = main
+    return {c: (m * 255 + 0.5).astype(np.uint8) for c, m in maps.items()}
+
+
 def segment_job(path, base, cats, create):
-    maps = G.get_segmenter(MODELS_DIR).masks(_seg_input(base), cats)
-    return path, {c: (m * 255 + 0.5).astype(np.uint8) for c, m in maps.items()}, create
+    return path, _ai_masks(base, cats), create
 
 
 def prepare_ai_job(items, out_dir):
     """ИИ-маски для кадров, которые ещё не открывали (перед экспортом)."""
-    segmenter = G.get_segmenter(MODELS_DIR)
     for path, cats in items:
         base = E.load_image(path, half=True, max_side=PREVIEW_SIDE)
-        for cat, m in segmenter.masks(_seg_input(base), cats).items():
-            _write_png(Path(out_dir) / f"{Path(path).name}.{cat}.png", (m * 255 + 0.5).astype(np.uint8))
+        for cat, m in _ai_masks(base, cats).items():
+            _write_png(Path(out_dir) / f"{Path(path).name}.{cat}.png", m)
 
 
 def _write_png(path: Path, arr: np.ndarray):
@@ -238,8 +254,7 @@ def grade_job(scene_defs, path, base, params, style, look, geo, maps, scene, thu
     if G.available():
         missing = [c for c in GR.MASK_CATS if maps.get(c) is None]
         if missing:
-            for c, m in G.get_segmenter(MODELS_DIR).masks(_seg_input(base), missing).items():
-                new[c] = (m * 255 + 0.5).astype(np.uint8)
+            new = _ai_masks(base, missing)
     allm = {**{c: m for c, m in maps.items() if m is not None}, **new}
     if scene is None and thumb is not None and S.available():
         scene = S.get_classifier(scene_defs, MODELS_DIR).classify([thumb])[0][0]
@@ -713,6 +728,7 @@ class MainWindow(QMainWindow):
         self.base_dn: np.ndarray | None = None   # превью текущего кадра без шума (полная сила)
         self.dn_busy = False
         self.ai_cache: dict[tuple[str, str], np.ndarray] = {}
+        self.seg_pending: set[tuple[str, str]] = set()  # (кадр, маска), которые уже считаются
         self.full_wh: tuple[int, int] = (1, 1)
         self.cam_aspects: dict[str, float | None] = {}
         self.crop_mode = False
@@ -924,6 +940,15 @@ class MainWindow(QMainWindow):
             "Кадры с высоким ISO получают его сами при открытии." if N.available()
             else "Нужны библиотеки ИИ: запустите install_ai.bat")
         self.rows["denoise"].setEnabled(N.available())
+        no_ai = "Нужны библиотеки ИИ: запустите install_ai.bat"
+        self.rows["retouch"].setToolTip(
+            "ИИ находит людей и разглаживает только кожу: пятна и неровности тона уходят,\n"
+            "поры и текстура остаются. Глаза, губы и волосы не трогаются" if G.available() else no_ai)
+        self.rows["bokeh"].setToolTip(
+            "Размытие фона, как у светосильного объектива. Резким остаётся главный объект:\n"
+            "человек, а если людей нет — самое заметное место кадра" if G.available() else no_ai)
+        for k in E.AI_SLIDER_CATS:
+            self.rows[k].setEnabled(G.available())
 
         # Тональная кривая
         box = QGroupBox("Тональная кривая")
@@ -1410,6 +1435,8 @@ class MainWindow(QMainWindow):
 
     def on_param(self, key, value):
         self.params[key] = value
+        if key in E.AI_SLIDER_CATS and value:
+            self.ensure_ai_masks()  # маска для ретуши/боке досчитается в фоне, дальше кадр перерисуется
         self.request_render()
 
     def current_style(self):
@@ -2083,6 +2110,9 @@ class MainWindow(QMainWindow):
                 c["arr"] = self.ai_arr(name, c["cat"])
             layers.append(c)
         out = {**p, "masks": layers}
+        ai = {cat: self.ai_arr(name, cat) for key, cat in E.AI_SLIDER_CATS.items() if p.get(key)}
+        if ai:
+            out["ai_arr"] = ai
         grade = p.get("ai_grade")
         if grade and grade.get("masks"):
             out["ai_grade"] = {**grade, "masks": [{**copy.deepcopy(m), "arr": self.ai_arr(name, m["cat"])}
@@ -2211,17 +2241,36 @@ class MainWindow(QMainWindow):
         run_task(segment_job, self.current, self.base, [cat], True, pool=AI_POOL,
                  done=self.on_segmented, fail=lambda m: self.toast(f"Маска ИИ не получилась: {m}", 10000))
 
+    @staticmethod
+    def ai_cats(p: dict) -> set[str]:
+        """Маски ИИ, которые нужны правкам: ИИ-слои, маски варианта ИИ-цвета, ползунки ИИ-ретуши."""
+        layers = list(p.get("masks") or []) + list((p.get("ai_grade") or {}).get("masks", []))
+        return ({m["cat"] for m in layers if m["type"] == "ai"}
+                | {cat for key, cat in E.AI_SLIDER_CATS.items() if p.get(key)})
+
     def ensure_ai_masks(self):
-        """У кадра есть ИИ-слои без готовой маски (например, после вставки правок) — досчитать в фоне."""
-        layers = self.masks() + list((self.params.get("ai_grade") or {}).get("masks", []))
-        cats = sorted({m["cat"] for m in layers if m["type"] == "ai"
-                       and self.ai_arr(self.current.name, m["cat"]) is None})
-        if cats and G.available():
-            run_task(segment_job, self.current, self.base, cats, False, pool=AI_POOL,
-                     done=self.on_segmented, fail=lambda m: self.toast(f"Маска ИИ не получилась: {m}", 10000))
+        """У правок кадра есть маски ИИ, которых ещё нет (вставка правок, ползунок ретуши) — досчитать в фоне."""
+        if self.base is None or not G.available():
+            return
+        name = self.current.name
+        cats = sorted(c for c in self.ai_cats(self.params)
+                      if self.ai_arr(name, c) is None and (name, c) not in self.seg_pending)
+        if not cats:
+            return
+        self.seg_pending |= {(name, c) for c in cats}  # второй раз ту же маску в очередь не ставим
+        if not G.loaded():
+            self.toast("ИИ ищет на кадре людей и объекты… В первый раз загружается модель", 0)
+
+        def failed(msg):
+            self.seg_pending -= {(name, c) for c in cats}
+            self.toast(f"Маска ИИ не получилась: {msg}", 10000)
+
+        run_task(segment_job, self.current, self.base, cats, False, pool=AI_POOL,
+                 done=self.on_segmented, fail=failed)
 
     def on_segmented(self, res):
         path, maps, create = res
+        self.seg_pending -= {(path.name, c) for c in maps}
         for cat, arr in maps.items():
             self.ai_cache[(path.name, cat)] = arr
             try:
@@ -2230,6 +2279,9 @@ class MainWindow(QMainWindow):
                 self.toast(f"Не удалось сохранить маску: {e}", 8000)
         if path != self.current:
             return
+        if "subject" in maps and maps["subject"].max() < 128 and self.params.get("bokeh"):
+            self.toast("Главный объект не найден (нет крупного человека или явного объекта) — "
+                       "размытие фона на этом кадре не применяется", 10000)
         if self._after_seg:
             then, self._after_seg = self._after_seg, None
             then()
@@ -2593,8 +2645,7 @@ class MainWindow(QMainWindow):
         missing = []
         for p in paths:
             fp = E.normalize_params(self.sidecar.get(p.name, self.params))
-            layers = fp.get("masks", []) + list((fp.get("ai_grade") or {}).get("masks", []))
-            cats = sorted({m["cat"] for m in layers if m["type"] == "ai" and self.ai_arr(p.name, m["cat"]) is None})
+            cats = sorted(c for c in self.ai_cats(fp) if self.ai_arr(p.name, c) is None)
             if cats:
                 missing.append((str(p), cats))
         if missing and G.available():

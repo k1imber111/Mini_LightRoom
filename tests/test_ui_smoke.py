@@ -310,6 +310,21 @@ if __name__ == "__main__":
         win.reset_crop()
         wait(app, lambda: not win.rendering and not win.dirty)
 
+        # ИИ-ретушь: ползунки берут готовые маски людей и главного объекта, кадр меняется
+        ui._write_png(d / ui.MASKS_DIR / f"{win.current.name}.subject.png", fake["people"])
+        plain = win.after.copy()
+        win.rows["retouch"].slider.setValue(60)
+        win.rows["bokeh"].slider.setValue(50)
+        rp = win.render_params()
+        assert rp["ai_arr"]["people"] is not None and rp["ai_arr"]["subject"] is not None, "маски ретуши не переданы"
+        assert "ai_arr" not in win.params, "массивы масок попали в правки"
+        wait(app, lambda: not win.rendering and not win.dirty)
+        assert win.after != plain, "ретушь и боке не изменили кадр"
+        assert not win.seg_pending, "маски уже были — пересчитывать не нужно"
+        win.rows["retouch"].slider.setValue(0)
+        win.rows["bokeh"].slider.setValue(0)
+        wait(app, lambda: not win.rendering and not win.dirty)
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))

@@ -267,6 +267,56 @@ for sc in scenes:
 print("авто:", E.auto_params(img * 0.3))
 assert E.auto_params(img * 0.3)["exposure"] > 0, "тёмный кадр должен осветляться"
 
+# ИИ-ретушь: кожа сглаживается только под маской людей, мелкая текстура остаётся.
+skin = np.full((600, 800, 3), (0.80, 0.60, 0.50), np.float32)
+blotch = cv2.GaussianBlur(rng.normal(0, 1, (600, 800)).astype(np.float32), (0, 0), 3)
+skin = np.clip(skin + 0.04 * blotch[..., None] / blotch.std(), 0, 1)
+people = np.zeros((600, 800), np.uint8)
+people[:, :400] = 255
+pr = {**E.default_params(), "retouch": 100, "ai_arr": {"people": people}}
+ret = E.process(skin, pr)
+before, after = (skin[50:550, 50:350] @ E.LUM).std(), (ret[50:550, 50:350] @ E.LUM).std()
+print(f"ретушь: неровность кожи {before:.3f} → {after:.3f}")
+assert after < before * 0.7, "ретушь не сгладила кожу"
+assert np.abs(ret[:, 450:] - skin[:, 450:]).max() < 1e-4, "ретушь задела не людей"
+assert np.abs(E.process(skin, {**pr, "ai_arr": {}}) - skin).max() < 1e-3, "без маски ретушь должна молчать"
+
+# Размытие фона: полосы фона размыты, объект не тронут, красный объект не растекается ореолом.
+bgimg = np.where((np.arange(800) // 6 % 2)[None, :, None] == 1, 0.6, 0.2).astype(np.float32) * np.ones((600, 1, 3), np.float32)
+bgimg[200:400, 300:500] = (0.9, 0.1, 0.1)
+subj = np.zeros((600, 800), np.uint8)
+subj[200:400, 300:500] = 255
+bo = E.process(bgimg, {**E.default_params(), "bokeh": 100, "ai_arr": {"subject": subj}})
+assert bo[:150].std() < bgimg[:150].std() * 0.3, "фон не размылся"
+assert np.abs(bo[220:380, 320:480] - bgimg[220:380, 320:480]).max() < 1e-3, "объект размылся"
+assert np.abs(E.process(bgimg, {**E.default_params(), "bokeh": 100, "ai_arr": {"subject": subj * 0}}) - bgimg).max() < 1e-3,     "без объекта размывать нельзя"
+people2 = np.zeros((600, 800), np.float32)
+people2[100:500, 100:300] = 1  # главный человек
+people2[100:180, 600:630] = 1  # прохожий вдали
+mp = E.main_people(people2)
+assert mp[300, 200] > 0.9 and mp[140, 615] == 0, "толпа попала в главный объект"
+assert E.main_people(people2 * 0) is None
+ring = bo[200:400, 505:515]  # фон в 5–15 px от края объекта
+print(f"боке: полосы фона {bgimg[:150].std():.3f} → {bo[:150].std():.3f}, красное у края {(ring[..., 0] - ring[..., 1]).max():.3f}")
+assert (ring[..., 0] - ring[..., 1]).max() < 0.03, "цвет объекта растёкся ореолом по фону"
+
+# Вырезка в масштабе совпадает с превью и с ретушью, и с боке.
+arr = np.zeros((1000, 1500), np.uint8)
+arr[250:800, 800:1100] = 255  # край маски проходит через вырезку
+pa = {**E.default_params(), "retouch": 80, "bokeh": 70, "ai_arr": {"people": arr, "subject": arr}}
+fa = E.process(img, pa)
+_, part_a = E.process_region(img, (600, 300, 1000, 700), 1.0, pa)
+da = np.abs(part_a - fa[300:700, 600:1000]).mean()
+print(f"ИИ-ретушь: вырезка против целого кадра {da:.4f}")
+assert da < 0.01, "ретушь/боке в увеличенной вырезке расходятся с превью"
+
+# Главный объект без людей — самое заметное пятно.
+scene = np.full((400, 600, 3), 0.3, np.float32) + rng.normal(0, 0.01, (400, 600, 3)).astype(np.float32)
+scene[120:220, 380:480] = (0.9, 0.7, 0.1)
+sm = E.saliency_mask(np.clip(scene, 0, 1))
+ys, xs = np.nonzero(sm > 0.5)
+assert sm.shape == (400, 600) and 360 < xs.mean() < 500 and 100 < ys.mean() < 240, (xs.mean(), ys.mean())
+
 with tempfile.TemporaryDirectory(prefix="мини_") as d:
     cube = Path(d) / "стиль.cube"
     E.export_cube(cube, p, style, E.lab_stats(img))
