@@ -244,6 +244,15 @@ HSL_CENTERS = {"red": 0, "orange": 30, "yellow": 60, "green": 120, "aqua": 180,
                "blue": 225, "purple": 270, "magenta": 315}
 
 
+def hsl_weights(hue) -> np.ndarray:
+    """Вклад 8 цветов HSL (порядок HSL_CENTERS) для оттенка в градусах HSV — треугольники ±45°,
+    как в _apply_hsl; сумма не больше 1. Для целевой правки: какие ползунки двигать и насколько."""
+    h = np.asarray(hue, np.float32)[..., None]
+    c = np.array(list(HSL_CENTERS.values()), np.float32)
+    w = np.clip(1 - np.abs((h - c + 180) % 360 - 180) / 45, 0, 1)
+    return w / np.maximum(w.sum(-1, keepdims=True), 1)
+
+
 def curve_lut(points, n: int = 1024) -> np.ndarray:
     """Монотонная кубическая кривая (Фритч — Карлсон) по точкам 0..255: без выбросов и ступенек."""
     pts = np.array(sorted(points), np.float64) / 255.0

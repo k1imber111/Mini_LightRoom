@@ -124,6 +124,12 @@ with tempfile.TemporaryDirectory() as d:
     E.export_cube(Path(d) / "b.cube", {**E.default_params(), "curve": {"rgb": [[0, 30], [255, 255]]}}, None, None)
     assert (Path(d) / "a.cube").read_text() != (Path(d) / "b.cube").read_text(), "кривая не попала в LUT"
 
+# Целевая правка: веса цветов HSL по оттенку.
+wts = E.hsl_weights(120)
+assert wts[list(E.HSL_CENTERS).index("green")] == 1 and wts.sum() <= 1
+w45 = E.hsl_weights(45)
+assert abs(w45[1] - w45[2]) < 1e-6 and w45.sum() <= 1 + 1e-6, "оранжево-жёлтый делится поровну"
+
 # Обрезка и горизонт: последний шаг, одна матрица для превью, масштаба и экспорта.
 W0, H0 = 1500, 1000
 c169 = E.aspect_crop(W0, H0, 16 / 9)

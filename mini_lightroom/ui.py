@@ -75,6 +75,7 @@ from . import segment as G
 from .crop_editor import CropEditor
 from .curve_editor import CURVE_SHAPES, CurveEditor
 from .mask_editor import MaskEditor
+from .target_editor import TargetEditor
 
 APP_DIR = Path(__file__).resolve().parent.parent
 STYLES_DIR = APP_DIR / "styles"
@@ -668,6 +669,9 @@ class MainWindow(QMainWindow):
         self.cam_aspects: dict[str, float | None] = {}
         self.crop_mode = False
         self.crop_backup: dict | None = None
+        self.target_mode: str | None = None
+        self._tat: dict | None = None
+        self.targeter = TargetEditor(self.tat_start, self.tat_drag)
         self.cropper = CropEditor()
         self.cropper.changed.connect(self.on_crop_rect)
         self.history: dict[str, dict] = {}   # {кадр: {"undo": [снимки правок], "redo": [...]}}
@@ -851,6 +855,13 @@ class MainWindow(QMainWindow):
         self.curve_shape.setToolTip("Готовая форма для выбранного канала")
         self.curve_shape.activated.connect(self.on_curve_shape)
         row.addWidget(self.curve_shape, 1)
+        self.tat_curve = QPushButton("🎯")
+        self.tat_curve.setCheckable(True)
+        self.tat_curve.setFixedWidth(34)
+        self.tat_curve.setToolTip("Целевая правка: нажмите на кадре и тяните вверх/вниз —\n"
+                                  "двигается точка кривой для тона под курсором")
+        self.tat_curve.toggled.connect(lambda on: self.set_target_mode("curve" if on else None))
+        row.addWidget(self.tat_curve)
         cvl.addLayout(row)
         self.curve = CurveEditor()
         self.curve.changed.connect(self.on_curve)
@@ -864,7 +875,7 @@ class MainWindow(QMainWindow):
         # HSL: оттенок, насыщенность, яркость по 8 цветам
         box = QGroupBox("HSL / Цвет")
         hl = QVBoxLayout(box)
-        tabs = QTabWidget()
+        tabs = self.hsl_tabs = QTabWidget()
         self.hsl_rows: dict[tuple[str, int], SliderRow] = {}
         tips = ("Сдвиг оттенка цвета: например, зелень в сторону мяты или жёлтого",
                 "Насыщенность только этого цвета", "Яркость только этого цвета: светлее кожа, темнее небо")
@@ -880,6 +891,14 @@ class MainWindow(QMainWindow):
                 self.hsl_rows[(color, idx)] = r
             tabs.addTab(w, tab_name)
         hl.addWidget(tabs)
+        row = QHBoxLayout()
+        self.tat_hsl = QPushButton("🎯 Тянуть по цвету на кадре")
+        self.tat_hsl.setCheckable(True)
+        self.tat_hsl.setToolTip("Целевая правка: нажмите на цвет на кадре и тяните вверх/вниз —\n"
+                                "двигаются ползунки этого цвета на открытой вкладке")
+        self.tat_hsl.toggled.connect(lambda on: self.set_target_mode("hsl" if on else None))
+        row.addWidget(self.tat_hsl, 1)
+        hl.addLayout(row)
         b = QPushButton("Сброс HSL")
         b.clicked.connect(self.reset_hsl)
         hl.addWidget(b)
@@ -1404,6 +1423,99 @@ class MainWindow(QMainWindow):
             r.set_value(0)
         self.request_render()
 
+    # ---------- целевая правка (тянуть по цвету/тону прямо на кадре)
+
+    def set_target_mode(self, mode: str | None):
+        if mode and (self.base is None or self.crop_mode):
+            mode = None
+        self.target_mode = mode
+        for btn, m in ((self.tat_hsl, "hsl"), (self.tat_curve, "curve")):
+            btn.blockSignals(True)
+            btn.setChecked(mode == m)
+            btn.blockSignals(False)
+        if mode:
+            self.mask_list.setCurrentRow(-1)
+            self.editor.set_layer(None)
+            self.view.editor = self.targeter
+            what = (f"ползунки «{self.hsl_tabs.tabText(self.hsl_tabs.currentIndex())}» цвета под курсором"
+                    if mode == "hsl" else "точка кривой для тона под курсором")
+            self.toast(f"🎯 Нажмите на кадре и тяните вверх/вниз — меняется {what}", 10000)
+        elif not self.crop_mode:
+            self.view.editor = self.editor
+        self.view.update()
+
+    def sample_input(self, pos, drop: tuple) -> np.ndarray | None:
+        """Цвет точки кадра на входе HSL/кривой: патч 5×5 превью через те же правки, но без
+        перечисленных в drop (и без стиля, пресета, масок), — как берёт цвет Lightroom."""
+        if self.base is None:
+            return None
+        xn, yn = self.view.to_norm(pos)
+        if not (0 <= xn < 1 and 0 <= yn < 1):
+            return None
+        h, w = self.base.shape[:2]
+        x, y = int(xn * w), int(yn * h)
+        patch = self.base[max(0, y - 2):y + 3, max(0, x - 2):x + 3]
+        p = {**self.params, "masks": [], "ai_grade": None, **{k: {} for k in drop}}
+        return E.process(patch, p, None, local=False).reshape(-1, 3).mean(0)
+
+    def tat_start(self, pos) -> bool:
+        if self.target_mode == "hsl":
+            rgb = self.sample_input(pos, ("hsl",))
+            if rgb is None:
+                return False
+            hsv = cv2.cvtColor(rgb.reshape(1, 1, 3).astype(np.float32), cv2.COLOR_RGB2HSV)[0, 0]
+            if hsv[1] < 0.06:
+                self.toast("Здесь почти нет цвета — целевая правка HSL работает по цветным участкам")
+                return False
+            weights = E.hsl_weights(hsv[0])
+            idx = self.hsl_tabs.currentIndex()
+            cur = self.params.get("hsl") or {}
+            names = list(E.HSL_CENTERS)
+            self._tat = {"w": {names[i]: float(v) for i, v in enumerate(weights) if v > 0.02}, "idx": idx,
+                         "start": {c: list(cur.get(c, [0, 0, 0])) for c in names}}
+            main = max(self._tat["w"], key=self._tat["w"].get)
+            label = next(lbl for key, lbl, _ in HSL_COLORS if key == main)
+            self.toast(f"🎯 {label}: тяните вверх — больше, вниз — меньше", 6000)
+            return True
+        rgb = self.sample_input(pos, ("hsl", "curve"))
+        if rgb is None:
+            return False
+        ch = self.curve.channel
+        x = float(rgb @ E.LUM) if ch == "rgb" else float(rgb["rgb".index(ch)])
+        x = round(min(max(x, 0.0), 1.0) * 255)
+        pts = [list(q) for q in self.curve.points()]
+        i = next((k for k, q in enumerate(pts) if abs(q[0] - x) <= 10), None)
+        if i is None:  # новая точка на кривой в этом тоне
+            y = round(float(E.curve_lut(pts, 256)[x]) * 255)
+            pts.append([x, y])
+            pts.sort()
+            i = pts.index([x, y])
+            self.curve.set_points(pts)
+        self._tat = {"i": i, "y0": pts[i][1]}
+        return True
+
+    def tat_drag(self, up_px: float):
+        t = self._tat
+        if not t:
+            return
+        if self.target_mode == "hsl":
+            hsl = {c: list(v) for c, v in (self.params.get("hsl") or {}).items()}
+            for color, w in t["w"].items():
+                vals = list(t["start"][color])
+                vals[t["idx"]] = int(np.clip(round(vals[t["idx"]] + up_px * 0.5 * w), -100, 100))
+                if any(vals):
+                    hsl[color] = vals
+                else:
+                    hsl.pop(color, None)
+                self.hsl_rows[(color, t["idx"])].set_value(vals[t["idx"]])
+            self.params["hsl"] = hsl
+            self.request_render()
+        else:
+            pts = [list(q) for q in self.curve.points()]
+            i = min(t["i"], len(pts) - 1)
+            pts[i][1] = int(np.clip(round(t["y0"] + up_px * 0.5), 0, 255))
+            self.curve.set_points(pts)
+
     # ---------- история: отмена и повтор
 
     def _hist(self) -> dict:
@@ -1550,6 +1662,7 @@ class MainWindow(QMainWindow):
         if on == self.crop_mode:
             return
         if on:
+            self.set_target_mode(None)
             self.crop_backup = {k: copy.deepcopy(self.params.get(k)) for k in ("crop", "angle")}
             W, H = self.full_wh
             self.cropper.size = (W, H)
@@ -1663,6 +1776,8 @@ class MainWindow(QMainWindow):
     def on_mask_select(self, row: int):
         layers = self.masks()
         layer = layers[row] if 0 <= row < len(layers) else None
+        if layer is not None and self.target_mode:
+            self.set_target_mode(None)
         if layer is not self.editor.layer:
             self.editor.set_layer(layer)
         self.mask_box.setVisible(layer is not None)

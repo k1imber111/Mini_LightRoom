@@ -241,6 +241,32 @@ if __name__ == "__main__":
         assert win.params["hsl"]["green"][1] == -60 and win.hsl_rows[("green", 1)].slider.value() == -60
         wait(app, lambda: not win.rendering and not win.dirty)
 
+        # целевая правка: тянуть по цвету/тону прямо на кадре
+        saved_base = win.base
+        colored = np.zeros_like(win.base)
+        half = colored.shape[1] // 2
+        colored[:, :half] = [0.2, 0.6, 0.2]     # зелень слева
+        colored[:, half:] = [0.8, 0.5, 0.25]    # оранжевый справа
+        win.base = colored
+        win.hsl_tabs.setCurrentIndex(1)         # вкладка «Насыщенность»
+        win.tat_hsl.setChecked(True)
+        assert win.view.editor is win.targeter
+        before_g = (win.params.get("hsl") or {}).get("green", [0, 0, 0])[1]
+        drag(at(0.25, 0.5), at(0.25, 0.5) - QPoint(0, 60))
+        assert win.params["hsl"]["green"][1] > before_g + 15, win.params["hsl"]
+        assert win.hsl_rows[("green", 1)].slider.value() == win.params["hsl"]["green"][1]
+        win.tat_curve.setChecked(True)
+        assert not win.tat_hsl.isChecked() and win.target_mode == "curve"
+        drag(at(0.75, 0.5), at(0.75, 0.5) - QPoint(0, 40))
+        pts = win.params["curve"]["rgb"]
+        mid_pt = [q for q in pts if 0 < q[0] < 255]
+        assert mid_pt and mid_pt[0][1] > mid_pt[0][0] + 10, pts
+        win.tat_curve.setChecked(False)
+        assert win.view.editor is win.editor
+        win.base = saved_base
+        win.reset_curve()
+        wait(app, lambda: not win.rendering and not win.dirty)
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))
