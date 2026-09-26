@@ -360,6 +360,18 @@ if __name__ == "__main__":
         assert win2.restore_session()
         wait(app, lambda: win2.current is not None and win2.current.name == "кадр_1.jpg" and win2.base is not None)
         assert win2.params["tint"] == 17, "правки не восстановились"
+        # история отмены пережила «перезапуск»: Ctrl+Z убирает правку прошлого сеанса, Ctrl+Y возвращает
+        assert E.read_json(d / ui.HISTORY_FILE, {}).get("кадр_1.jpg"), "история отмены не записана"
+        win2.undo()
+        assert win2.params["tint"] != 17, "отмена после перезапуска не сработала"
+        win2.redo()
+        assert win2.params["tint"] == 17
+        # другая папка с таким же именем кадра — своя история, чужие шаги не подмешиваются
+        d2 = Path(tempfile.mkdtemp(prefix="другая_папка_"))
+        (d2 / "кадр_1.jpg").write_bytes((d / "кадр_1.jpg").read_bytes())
+        win2.load_folder(d2)
+        wait(app, lambda: win2.current is not None and win2.current.parent == d2 and win2.base is not None)
+        assert len(win2._hist()["undo"]) == 1, "история смешалась между папками"
         win2.close()
         E.write_json(ui.SETTINGS_FILE, {"last_folder": str(d / "нет_такой")})
         win3 = MainWindow()

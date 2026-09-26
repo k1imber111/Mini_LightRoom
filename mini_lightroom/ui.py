@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import statistics
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -88,6 +89,8 @@ SCENES_KEY = "__scenes__"   # в sidecar: {имя файла: [id сцены, у
 PRESETS_DIR = APP_DIR / "presets"
 SETTINGS_FILE = APP_DIR / "settings.json"  # последняя папка и кадр, окно, галочки — между запусками
 SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат рядом со снимками
+HISTORY_FILE = ".mini_lightroom_history.json"  # шаги отмены кадров — тоже рядом, чтобы Ctrl+Z пережил перезапуск
+HISTORY_KEEP = 50  # шагов на кадр в файле (в памяти — 100)
 MASKS_DIR = ".mini_lightroom_masks"  # ИИ-маски кадров (PNG) рядом со снимками
 PREVIEW_SIDE = 1400
 PATH_ROLE = Qt.UserRole
@@ -723,6 +726,7 @@ class MainWindow(QMainWindow):
         self.cropper = CropEditor()
         self.cropper.changed.connect(self.on_crop_rect)
         self.history: dict[str, dict] = {}   # {кадр: {"undo": [снимки правок], "redo": [...]}}
+        self.history_dirty = False  # история изменилась с последней записи в файл
         self.history_timer = QTimer(self, singleShot=True, interval=400, timeout=self.commit_history)
         # Автосохранение правок: через 1.5 с после шага истории файл правок уже на диске.
         self.save_timer = QTimer(self, singleShot=True, interval=1500, timeout=self.save_sidecar)
@@ -1233,6 +1237,9 @@ class MainWindow(QMainWindow):
         self.folder = folder
         self.files = sorted(p for p in folder.iterdir() if p.suffix.lower() in E.PHOTO_EXT)
         self.sidecar = E.read_json(folder / SIDECAR, {})
+        self.history = {name: {k: [E.normalize_params(p) for p in h.get(k, [])] for k in ("undo", "redo")}
+                        for name, h in E.read_json(folder / HISTORY_FILE, {}).items() if isinstance(h, dict)}
+        self.history_dirty = False
         self.scene_of = dict(self.sidecar.get(SCENES_KEY, {}))
         self.thumbs.clear()
         self.scores.clear()
@@ -1329,8 +1336,12 @@ class MainWindow(QMainWindow):
         self.params = E.normalize_params(saved)
         if not saved and self.auto_on_open.isChecked():
             self.params.update(self.auto_for(path.name, img)[0])
-        if path.name not in self.history:
+        h = self.history.get(path.name)
+        if not h or not h["undo"]:
             self.history[path.name] = {"undo": [copy.deepcopy(self.params)], "redo": []}
+        elif json.dumps(h["undo"][-1], sort_keys=True) != json.dumps(self.params, sort_keys=True):
+            h["undo"].append(copy.deepcopy(self.params))  # правки меняли в обход истории — это тоже шаг
+            h["redo"].clear()
         if not saved and self.crop_cam.isChecked() and self._cam_differs(path.name):
             W, H = size
             self.params["crop"] = E.aspect_crop(W, H, cam)
@@ -1364,6 +1375,14 @@ class MainWindow(QMainWindow):
                 E.write_json(self.folder / SIDECAR, self.sidecar)
             except OSError as e:
                 self.toast(f"Не удалось сохранить правки: {e}", 8000)
+        if self.folder and self.history_dirty:
+            data = {name: {k: h[k][-HISTORY_KEEP:] for k in ("undo", "redo")}
+                    for name, h in self.history.items() if len(h["undo"]) > 1 or h["redo"]}
+            try:
+                E.write_json(self.folder / HISTORY_FILE, data)
+                self.history_dirty = False
+            except OSError as e:
+                self.toast(f"Не удалось сохранить историю отмены: {e}", 8000)
 
     # ---------- правки и рендер
 
@@ -1832,6 +1851,7 @@ class MainWindow(QMainWindow):
             h["redo"].clear()
             del h["undo"][:-100]  # храним последние 100 шагов на кадр
             if len(h["undo"]) > 1:  # это настоящая правка, а не открытие кадра
+                self.history_dirty = True
                 self.save_timer.start()
 
     def _restore(self, snap: dict):
@@ -1853,6 +1873,8 @@ class MainWindow(QMainWindow):
             return
         h["redo"].append(h["undo"].pop())
         self._restore(h["undo"][-1])
+        self.history_dirty = True
+        self.save_timer.start()
         self.toast(f"Отменено. Ещё шагов назад: {len(h['undo']) - 1}. Ctrl+Y — вернуть")
 
     def redo(self):
@@ -1865,6 +1887,8 @@ class MainWindow(QMainWindow):
             return
         h["undo"].append(h["redo"].pop())
         self._restore(h["undo"][-1])
+        self.history_dirty = True
+        self.save_timer.start()
         self.toast("Возвращено")
 
     # ---------- обрезка и горизонт
@@ -2307,6 +2331,7 @@ class MainWindow(QMainWindow):
             self.params = self.sidecar[self.current.name]
             self.sync_controls()
             self.request_render()
+        self.history_dirty |= bool(items)
         self.save_sidecar()
         self.toast(f"Правки вставлены в кадров: {len(items)}")
 
