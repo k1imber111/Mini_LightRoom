@@ -1,5 +1,6 @@
 """Прогон окна без экрана: папка с кириллицей → миниатюры → рендер → правки → экспорт.
 Запуск: python tests\\test_ui_smoke.py"""
+import json
 import os
 import sys
 import tempfile
@@ -281,6 +282,11 @@ if __name__ == "__main__":
         win.start_grade()
         wait(app, lambda: not win.grade_busy and win.carousel.count() > 1, 120)
         assert win.carousel.isVisible() and win.carousel.count() == len(win.grade_variants) + 1
+        texts = [win.carousel.item(i).text() for i in range(win.carousel.count())]
+        assert sum(t.startswith("★") for t in texts) == 1, f"★ должна стоять у одного варианта: {texts}"
+        win.carousel.clear()
+        win.start_grade()  # правки не менялись — карусель из кэша, без пересчёта
+        assert not win.grade_busy and win.carousel.count() == len(texts), "кэш карусели не сработал"
         win.carousel.setCurrentRow(1)
         assert win.params["ai_grade"]["id"] == win.grade_variants[0]["id"]
         win.grade_strength_row.slider.setValue(40)
@@ -323,6 +329,18 @@ if __name__ == "__main__":
         assert not win.seg_pending, "маски уже были — пересчитывать не нужно"
         win.rows["retouch"].slider.setValue(0)
         win.rows["bokeh"].slider.setValue(0)
+        wait(app, lambda: not win.rendering and not win.dirty)
+
+        # «ИИ-улучшить»: тон + естественные цвета одним шагом, одно Ctrl+Z возвращает всё
+        win.commit_history()
+        before = json.dumps(win.params, sort_keys=True, default=str)
+        win.ai_enhance()
+        wait(app, lambda: not win.enhance_busy, 120)
+        assert (win.params.get("ai_grade") or {}).get("id") == "natural", win.params.get("ai_grade")
+        wait(app, lambda: not win.rendering and not win.dirty)
+        win.commit_history()
+        win.undo()
+        assert json.dumps(win.params, sort_keys=True, default=str) == before, "ИИ-улучшить не отменилось одним шагом"
         wait(app, lambda: not win.rendering and not win.dirty)
 
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила

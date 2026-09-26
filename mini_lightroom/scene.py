@@ -72,6 +72,33 @@ class SceneClassifier:
             e = torch.stack(embs)
             self.text = e / e.norm(dim=-1, keepdim=True)
 
+    # Описания удачной и неудачной обработки: оценка = сходство с первыми минус сходство со вторыми.
+    GOOD = ("a beautiful professionally color graded photograph", "an award-winning photo with pleasing colors",
+            "a stunning photo with harmonious natural colors")
+    BAD = ("a badly edited photo with unnatural colors", "an oversaturated garish photo",
+           "a dull washed out photo", "a photo with an ugly color cast")
+
+    def aesthetic(self, images: list[np.ndarray]) -> list[float]:
+        """uint8 RGB-миниатюры → оценка обработки (больше — удачнее). Слабый сигнал: подсказка, не приговор."""
+        import open_clip
+        from PIL import Image
+
+        torch = self.torch
+        with GPU_LOCK, torch.no_grad():
+            if not hasattr(self, "_taste"):
+                tok = open_clip.get_tokenizer(MODEL)
+
+                def enc(texts):
+                    e = self.model.encode_text(tok(list(texts)).to(self.device)).float()
+                    return (e / e.norm(dim=-1, keepdim=True)).mean(0)
+
+                self._taste = torch.stack([enc(self.GOOD), enc(self.BAD)])
+            x = torch.stack([self.preprocess(Image.fromarray(im)) for im in images]).to(self.device)
+            f = self.model.encode_image(x.half() if self.device == "cuda" else x).float()
+            f = f / f.norm(dim=-1, keepdim=True)
+            sim = (100 * f @ self._taste.T).cpu().numpy()
+        return [float(g - b) for g, b in sim]
+
     def classify(self, images: list[np.ndarray], batch: int = 32) -> list[tuple[str, float]]:
         """uint8 RGB-миниатюры → [(id сцены, уверенность 0..1)]."""
         from PIL import Image

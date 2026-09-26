@@ -248,8 +248,8 @@ def _write_png(path: Path, arr: np.ndarray):
     path.write_bytes(cv2.imencode(".png", arr)[1].tobytes())  # через Python: кириллица в пути
 
 
-def grade_job(scene_defs, path, base, params, style, look, geo, maps, scene, thumb):
-    """ИИ-цветокоррекция: маски объектов → сцена → анализ цвета → варианты по правилам → миниатюры карусели."""
+def _grade_analysis(scene_defs, base, params, maps, scene, thumb):
+    """Маски объектов → сцена → анализ цвета → варианты по правилам. Общая часть карусели и «ИИ-улучшить»."""
     new = {}
     if G.available():
         missing = [c for c in GR.MASK_CATS if maps.get(c) is None]
@@ -263,7 +263,12 @@ def grade_job(scene_defs, path, base, params, style, look, geo, maps, scene, thu
     seg = {c: cv2.resize(m, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
            for c, m in allm.items()} or None
     an = GR.analyze(pre, seg, scene)
-    vs = GR.variants(an)
+    return new, allm, scene, an, GR.variants(an)
+
+
+def grade_job(scene_defs, path, base, params, style, look, geo, maps, scene, thumb):
+    """ИИ-цветокоррекция: анализ → варианты → миниатюры карусели → оценка CLIP (★ самому удачному)."""
+    new, allm, scene, an, vs = _grade_analysis(scene_defs, base, params, maps, scene, thumb)
     tiny = E.resize_max(base, 260)
     crop, angle, full = geo
     strength = (params.get("ai_grade") or {}).get("strength", 80)
@@ -276,7 +281,16 @@ def grade_job(scene_defs, path, base, params, style, look, geo, maps, scene, thu
         return to_u8(E.apply_crop(E.process(tiny, p, style, look=look), crop, angle, full))
 
     thumbs = [render(None)] + [render(v) for v in vs]
-    return path, new, scene, an, vs, thumbs
+    scores = S.get_classifier(scene_defs, MODELS_DIR).aesthetic(thumbs) if S.available() else None
+    return path, new, scene, an, vs, thumbs, scores
+
+
+def enhance_job(scene_defs, path, base, params, auto, maps, scene, thumb):
+    """«ИИ-улучшить»: вариант «Естественные цвета» после авто-тона + угол горизонта."""
+    new, allm, scene, _an, vs = _grade_analysis(scene_defs, base, {**params, **auto}, maps, scene, thumb)
+    sky = allm.get("sky")
+    angle = E.auto_horizon(_seg_input(base), None if sky is None else sky.astype(np.float32) / 255)
+    return path, new, scene, auto, next((v for v in vs if v["id"] == "natural"), None), angle
 
 
 def horizon_job(path, base, sky):
@@ -736,6 +750,8 @@ class MainWindow(QMainWindow):
         self._after_seg = None  # что сделать, когда досчитаются маски (кадр по третям)
         self.grade_variants: list[dict] = []
         self.grade_busy = False
+        self.enhance_busy = False
+        self.grade_cache: dict[str, tuple] = {}  # {кадр: (ключ правок, варианты, миниатюры, оценки)}
         self.target_mode: str | None = None
         self._tat: dict | None = None
         self.targeter = TargetEditor(self.tat_start, self.tat_drag)
@@ -790,6 +806,9 @@ class MainWindow(QMainWindow):
         self.a_grade = self._action("🎨 ИИ-цвет", self.start_grade, "G",
                                     "Варианты цветокоррекции по законам фотографии: ИИ видит, что на кадре")
         tb.addAction(self.a_grade)
+        self.a_enhance = self._action("✨ ИИ-улучшить", self.ai_enhance, "Shift+A",
+                                      "Одной кнопкой: тон и баланс белого, естественные цвета, ровный горизонт")
+        tb.addAction(self.a_enhance)
         self.a_crop = self._action("✂ Обрезка", self.toggle_crop, "C", "Обрезка и горизонт: рамка на кадре")
         self.a_crop.setCheckable(True)
         tb.addAction(self.a_crop)
@@ -868,6 +887,11 @@ class MainWindow(QMainWindow):
                      "цвета памяти, гармонии цветового круга, тёплое/холодное, фигура и фон, 60-30-10, ч/б.\n"
                      "Варианты — в карусели под кадром, щелчок применяет")
         b.clicked.connect(self.start_grade)
+        gl.addWidget(b)
+        b = QPushButton("✨ ИИ-улучшить (Shift+A)")
+        b.setToolTip("Авто-тон и баланс белого (с пресетом сцены, если включён), цвета памяти — кожа, небо,\n"
+                     "зелень — к эталону, горизонт выровнен, если он уверенно найден. Одно Ctrl+Z отменяет всё")
+        b.clicked.connect(self.ai_enhance)
         gl.addWidget(b)
         self.grade_rule = QLabel("Нажмите кнопку — под кадром появятся варианты")
         self.grade_rule.setWordWrap(True)
@@ -1271,6 +1295,7 @@ class MainWindow(QMainWindow):
         self.blurry.clear()
         self.items.clear()
         self.cache.clear()
+        self.grade_cache.clear()  # варианты карусели — по именам кадров этой папки
         self.current = None
         self.strip.clear()
         self.setWindowTitle(f"Mini LightRoom — {folder}")
@@ -1689,8 +1714,12 @@ class MainWindow(QMainWindow):
         self.carousel.show()
         if self.grade_busy:
             return
-        self.grade_busy = True
         name = self.current.name
+        cached = self.grade_cache.get(name)
+        if cached and cached[0] == self._grade_key():  # правки те же — карусель сразу, без пересчёта
+            self._fill_carousel(*cached[1:])
+            return
+        self.grade_busy = True
         maps = {c: self.ai_arr(name, c) for c in GR.MASK_CATS}
         scene = (self.scene_of.get(name) or [None])[0]
         first = not G.loaded() and G.available() and any(m is None for m in maps.values())
@@ -1701,9 +1730,28 @@ class MainWindow(QMainWindow):
                  self.thumbs.get(name), done=self.on_graded, fail=self.on_grade_fail, pool=AI_POOL)
 
     def on_graded(self, res):
-        path, new, scene, an, vs, thumbs = res
+        path, new, scene, an, vs, thumbs, scores = res
         self.grade_busy = False
-        for cat, arr in new.items():
+        self._store_ai(path, new, scene)
+        if path != self.current:  # пока считали, открыли другой кадр
+            self.start_grade()
+            return
+        self.grade_cache[path.name] = (self._grade_key(), vs, thumbs, scores)
+        if len(self.grade_cache) > 12:
+            self.grade_cache.pop(next(iter(self.grade_cache)))
+        self._fill_carousel(vs, thumbs, scores)
+        found = [GR.LABELS.get(r, "") for r in an["regions"] if r in GR.LABELS]
+        sc = self.scene_by_id.get(scene or "", {}).get("name", "не определена")
+        self.toast(f"Вариантов: {len(vs)}. Сцена: {sc.lower()}. Найдено: {', '.join(found) or 'без масок объектов'}."
+                   " Щёлкайте по карусели под кадром", 10000)
+
+    def _grade_key(self) -> str:
+        """Правки, от которых зависят варианты карусели (всё, кроме самой ИИ-цветокоррекции)."""
+        return json.dumps({k: v for k, v in self.params.items() if k != "ai_grade"}, sort_keys=True, default=str)
+
+    def _store_ai(self, path: Path, masks: dict, scene: str | None):
+        """Маски и сцену, досчитанные ИИ-задачей, — в кэш и на диск."""
+        for cat, arr in masks.items():
             self.ai_cache[(path.name, cat)] = arr
             try:
                 _write_png(path.parent / MASKS_DIR / f"{path.name}.{cat}.png", arr)
@@ -1712,23 +1760,59 @@ class MainWindow(QMainWindow):
         if scene and path.name not in self.scene_of:
             self.scene_of[path.name] = [scene, 0.0]
             self.update_item(path.name)
-        if path != self.current:  # пока считали, открыли другой кадр
-            self.start_grade()
-            return
+
+    def _fill_carousel(self, vs: list, thumbs: list, scores: list | None):
         self.grade_variants = vs
+        best = int(np.argmax(scores)) if scores else -1
         c = self.carousel
         c.blockSignals(True)
         c.clear()
         for i, th in enumerate(thumbs):
-            it = QListWidgetItem(QIcon(QPixmap.fromImage(to_qimage(th))), "Исходный" if i == 0 else vs[i - 1]["name"])
-            it.setToolTip("Без ИИ-цветокоррекции" if i == 0 else vs[i - 1]["rule"])
+            name = "Исходный" if i == 0 else vs[i - 1]["name"]
+            tip = "Без ИИ-цветокоррекции" if i == 0 else vs[i - 1]["rule"]
+            if i == best:
+                name, tip = f"★ {name}", f"{tip}\n★ ИИ (CLIP) считает этот вариант самым удачным — это подсказка"
+            it = QListWidgetItem(QIcon(QPixmap.fromImage(to_qimage(th))), name)
+            it.setToolTip(tip + (f"\nОценка ИИ: {scores[i]:+.1f}" if scores else ""))
             c.addItem(it)
         c.blockSignals(False)
         self._sync_grade()
-        found = [GR.LABELS.get(r, "") for r in an["regions"] if r in GR.LABELS]
-        sc = self.scene_by_id.get(scene or "", {}).get("name", "не определена")
-        self.toast(f"Вариантов: {len(vs)}. Сцена: {sc.lower()}. Найдено: {', '.join(found) or 'без масок объектов'}."
-                   " Щёлкайте по карусели под кадром", 10000)
+
+    # ---------- «ИИ-улучшить»: всё лучшее одной кнопкой
+
+    def ai_enhance(self):
+        if self.base is None or self.enhance_busy:
+            return
+        self.enhance_busy = True
+        name = self.current.name
+        auto, _ = self.auto_for(name, self.base)
+        maps = {c: self.ai_arr(name, c) for c in GR.MASK_CATS}
+        self.toast("ИИ улучшает кадр: тон, цвета памяти, горизонт…"
+                   + (" В первый раз загружаются модели" if not G.loaded() and G.available() else ""), 0)
+        run_task(enhance_job, self.scene_defs, self.current, self.base, self.render_params({**self.params, "ai_grade": None}),
+                 auto, maps, (self.scene_of.get(name) or [None])[0], self.thumbs.get(name), pool=AI_POOL,
+                 done=self.on_enhanced,
+                 fail=lambda m: (setattr(self, "enhance_busy", False), self.toast(f"Не получилось: {m}", 10000)))
+
+    def on_enhanced(self, res):
+        path, new, scene, auto, natural, angle = res
+        self.enhance_busy = False
+        self._store_ai(path, new, scene)
+        if path != self.current or self.base is None:
+            return
+        self.commit_history()  # всё ниже — один шаг: одно Ctrl+Z возвращает кадр как был
+        self.params.update(auto)
+        done = ["тон и баланс белого"]
+        self.params["ai_grade"] = {**copy.deepcopy(natural), "strength": 80} if natural else None
+        if natural:
+            done.append("естественные цвета")
+        if angle is not None and 0.3 <= abs(angle) <= 5 and not self.params.get("angle"):
+            self.on_angle(float(angle))
+            done.append(f"горизонт {angle:+.1f}°")
+        self.sync_controls()
+        self._sync_grade()
+        self.request_render()
+        self.toast(f"ИИ-улучшить: {', '.join(done)}. Ctrl+Z — вернуть", 8000)
 
     def on_grade_fail(self, msg):
         self.grade_busy = False
