@@ -16,6 +16,8 @@ def main():
     win.show()
     if len(sys.argv) > 1 and Path(sys.argv[1]).is_dir():
         win.load_folder(Path(sys.argv[1]))
+    else:
+        win.restore_session()  # последняя папка на последнем кадре — продолжаем, где остановились
     sys.exit(app.exec())
 
 

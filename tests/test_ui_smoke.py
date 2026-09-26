@@ -33,6 +33,7 @@ if __name__ == "__main__":
     ui.PREVIEW_SIDE = 400  # превью меньше кадра, чтобы проверить просмотр в масштабе
     styles_tmp = tempfile.TemporaryDirectory(prefix="стили_")
     ui.STYLES_DIR = Path(styles_tmp.name)  # не трогаем настоящую библиотеку стилей
+    ui.SETTINGS_FILE = Path(styles_tmp.name) / "settings.json"  # и настоящую память сессии
     with tempfile.TemporaryDirectory(prefix="съёмка_") as d:
         d = Path(d)
         rng = np.random.default_rng(1)
@@ -343,6 +344,26 @@ if __name__ == "__main__":
         win.strip.setCurrentRow(1)
         wait(app, lambda: win.current and win.current.name == "кадр_1.jpg" and win.base is not None)
         assert "кадр_0.jpg" in win.sidecar, "правки первого кадра не запомнились"
+
+        # автосохранение: правка без закрытия окна уже на диске
+        win.rows["tint"].slider.setValue(17)
+        wait(app, lambda: not win.rendering and not win.dirty)
+        win.commit_history()
+        wait(app, lambda: E.read_json(d / ".mini_lightroom.json", {}).get("кадр_1.jpg", {}).get("tint") == 17, 10)
+
+        # память сессии: «перезапуск» открывает ту же папку на том же кадре с правками
+        st = E.read_json(ui.SETTINGS_FILE, {})
+        assert st.get("last_folder") == str(d) and st.get("last_file") == "кадр_1.jpg", st
+        win2 = MainWindow()
+        win2.show()
+        assert win2.restore_session()
+        wait(app, lambda: win2.current is not None and win2.current.name == "кадр_1.jpg" and win2.base is not None)
+        assert win2.params["tint"] == 17, "правки не восстановились"
+        win2.close()
+        E.write_json(ui.SETTINGS_FILE, {"last_folder": str(d / "нет_такой")})
+        win3 = MainWindow()
+        assert not win3.restore_session(), "несуществующая папка не должна открываться"
+        win3.close()
 
         assert win.sidecar["кадр_0.jpg"]["look"] == name, "пресет не сохранился в правках кадра"
         jobs = [{"src": str(p), "dst": str(d / "export" / f"{p.stem}.jpg"), "params": win.sidecar["кадр_0.jpg"],

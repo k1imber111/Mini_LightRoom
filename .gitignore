@@ -25,3 +25,7 @@ models/
 # логи пробных запусков
 run_*.txt
 .ruff_cache/
+
+# память сессии (последняя папка, окно)
+settings.json
+*.json.tmp

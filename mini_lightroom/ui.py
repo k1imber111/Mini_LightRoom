@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import (
+    QByteArray,
     QObject,
     QPointF,
     QRectF,
@@ -85,6 +86,7 @@ SCENES_FILE = APP_DIR / "scenes.json"
 MODELS_DIR = APP_DIR / "models"
 SCENES_KEY = "__scenes__"   # в sidecar: {имя файла: [id сцены, уверенность]}
 PRESETS_DIR = APP_DIR / "presets"
+SETTINGS_FILE = APP_DIR / "settings.json"  # последняя папка и кадр, окно, галочки — между запусками
 SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат рядом со снимками
 MASKS_DIR = ".mini_lightroom_masks"  # ИИ-маски кадров (PNG) рядом со снимками
 PREVIEW_SIDE = 1400
@@ -717,6 +719,9 @@ class MainWindow(QMainWindow):
         self.cropper.changed.connect(self.on_crop_rect)
         self.history: dict[str, dict] = {}   # {кадр: {"undo": [снимки правок], "redo": [...]}}
         self.history_timer = QTimer(self, singleShot=True, interval=400, timeout=self.commit_history)
+        # Автосохранение правок: через 1.5 с после шага истории файл правок уже на диске.
+        self.save_timer = QTimer(self, singleShot=True, interval=1500, timeout=self.save_sidecar)
+        self.settings: dict = E.read_json(SETTINGS_FILE, {})
         self.editor = MaskEditor(self.ai_arr_for_layer,
                                  (lambda: self.base.shape[:2], lambda m: E.apply_crop(m, *self.display_geo())))
         self.editor.changed.connect(self.on_mask_geom)
@@ -1179,6 +1184,38 @@ class MainWindow(QMainWindow):
     def toast(self, text, ms=4000):
         self.statusBar().showMessage(text, ms)
 
+    # ---------- сессия: последняя папка и кадр, окно, галочки
+
+    def remember(self, **values):
+        """Обновить settings.json (маленький файл — пишем сразу, чтобы пережить и аварийное закрытие)."""
+        self.settings.update(values)
+        try:
+            E.write_json(SETTINGS_FILE, self.settings)
+        except OSError:
+            pass  # папка программы только для чтения — работаем без памяти сессии
+
+    def restore_session(self) -> bool:
+        """Открыть последнюю папку на последнем кадре; окно и галочки — как были. False — нечего открывать."""
+        st = self.settings
+        if st.get("geometry"):
+            self.restoreGeometry(QByteArray.fromHex(st["geometry"].encode()))
+        for box, key in ((self.auto_on_open, "auto_on_open"), (self.scene_auto, "scene_auto"),
+                         (self.crop_cam, "crop_cam")):
+            if key in st:
+                box.setChecked(bool(st[key]))
+        folder = Path(st["last_folder"]) if st.get("last_folder") else None
+        if folder is None or not folder.is_dir():
+            if folder is not None:
+                self.toast(f"Последняя папка не найдена: {folder}", 8000)
+            return False
+        last = st.get("last_file")
+        self.load_folder(folder)
+        if last in self.items:
+            self.strip.setCurrentItem(self.items[last])
+            self.strip.scrollToItem(self.items[last])
+        self.toast(f"Продолжаем: {folder.name}" + (f", кадр {last}" if last in self.items else ""), 6000)
+        return True
+
     # ---------- папка и миниатюры
 
     def open_folder(self):
@@ -1200,6 +1237,7 @@ class MainWindow(QMainWindow):
         self.current = None
         self.strip.clear()
         self.setWindowTitle(f"Mini LightRoom — {folder}")
+        self.remember(last_folder=str(folder))
         if not self.files:
             self.view.set_image(None)
             self.view.message = "В этой папке нет снимков (ARW, DNG, NEF, CR3, JPEG…)\nОткройте другую папку"
@@ -1257,6 +1295,7 @@ class MainWindow(QMainWindow):
         self.commit_history()
         self.store_current()
         self.current = Path(item.data(PATH_ROLE))
+        self.remember(last_file=self.current.name)
         self.base = None
         self.full = self.full_path = None
         self.base_dn = None
@@ -1775,6 +1814,8 @@ class MainWindow(QMainWindow):
             h["undo"].append(snap)
             h["redo"].clear()
             del h["undo"][:-100]  # храним последние 100 шагов на кадр
+            if len(h["undo"]) > 1:  # это настоящая правка, а не открытие кадра
+                self.save_timer.start()
 
     def _restore(self, snap: dict):
         self.params = copy.deepcopy(snap)
@@ -2581,7 +2622,11 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.export_dir)))
 
     def closeEvent(self, e):
+        self.commit_history()
         self.save_sidecar()
+        self.remember(geometry=bytes(self.saveGeometry().toHex()).decode(),
+                      auto_on_open=self.auto_on_open.isChecked(), scene_auto=self.scene_auto.isChecked(),
+                      crop_cam=self.crop_cam.isChecked())
         if self.export_thread:
             self.export_thread.stop = True
             self.export_thread.wait()
