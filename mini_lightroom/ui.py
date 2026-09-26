@@ -69,6 +69,7 @@ from PySide6.QtWidgets import (
 
 from . import engine as E
 from . import enhance as N
+from . import grading as GR
 from . import masks as MK
 from . import scene as S
 from . import segment as G
@@ -221,6 +222,42 @@ def prepare_ai_job(segmenter, items, out_dir):
 def _write_png(path: Path, arr: np.ndarray):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(cv2.imencode(".png", arr)[1].tobytes())  # через Python: кириллица в пути
+
+
+def grade_job(segmenter, classifier, scene_defs, path, base, params, style, look, geo, maps, scene, thumb):
+    """ИИ-цветокоррекция: маски объектов → сцена → анализ цвета → варианты по правилам → миниатюры карусели."""
+    new = {}
+    if G.available():
+        missing = [c for c in GR.MASK_CATS if maps.get(c) is None]
+        if missing:
+            if segmenter is None:
+                segmenter = G.Segmenter(MODELS_DIR)
+            for c, m in segmenter.masks(_seg_input(base), missing).items():
+                new[c] = (m * 255 + 0.5).astype(np.uint8)
+    allm = {**{c: m for c, m in maps.items() if m is not None}, **new}
+    if scene is None and thumb is not None and S.available():
+        if classifier is None:
+            classifier = S.SceneClassifier(scene_defs, MODELS_DIR)
+        scene = classifier.classify([thumb])[0][0]
+    small = E.resize_max(base, 512)
+    pre = E.process(small, {**params, "ai_grade": None, "style": "", "look": "", "masks": []})
+    seg = {c: cv2.resize(m, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
+           for c, m in allm.items()} or None
+    an = GR.analyze(pre, seg, scene)
+    vs = GR.variants(an)
+    tiny = E.resize_max(base, 260)
+    crop, angle, full = geo
+    strength = (params.get("ai_grade") or {}).get("strength", 80)
+
+    def render(grade):
+        p = {**params, "ai_grade": None}
+        if grade:
+            p["ai_grade"] = {**grade, "strength": strength,
+                             "masks": [{**m, "arr": allm.get(m["cat"])} for m in grade["masks"]]}
+        return to_u8(E.apply_crop(E.process(tiny, p, style, look=look), crop, angle, full))
+
+    thumbs = [render(None)] + [render(v) for v in vs]
+    return segmenter, classifier, path, new, scene, an, vs, thumbs
 
 
 def full_job(path):
@@ -512,7 +549,8 @@ class SliderRow(QWidget):
             self.value.setText(f"{v / 100:+.2f} EV")
         elif self.key == "angle_x10":
             self.value.setText(f"{v / 10:+.1f}°" if v else "0°")
-        elif self.key in ("sharpness", "brush_size", "mask_feather") or self.key.startswith(("style_", "look_")):
+        elif self.key in ("sharpness", "brush_size", "mask_feather") or self.key.startswith(("style_", "look_",
+                                                                                              "grade_")):
             self.value.setText(f"{v}")
         else:
             self.value.setText(f"{v:+d}" if v else "0")
@@ -669,6 +707,8 @@ class MainWindow(QMainWindow):
         self.cam_aspects: dict[str, float | None] = {}
         self.crop_mode = False
         self.crop_backup: dict | None = None
+        self.grade_variants: list[dict] = []
+        self.grade_busy = False
         self.target_mode: str | None = None
         self._tat: dict | None = None
         self.targeter = TargetEditor(self.tat_start, self.tat_drag)
@@ -716,6 +756,9 @@ class MainWindow(QMainWindow):
         self.a_redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
         tb.addAction(self.a_undo)
         tb.addAction(self.a_redo)
+        self.a_grade = self._action("🎨 ИИ-цвет", self.start_grade, "G",
+                                    "Варианты цветокоррекции по законам фотографии: ИИ видит, что на кадре")
+        tb.addAction(self.a_grade)
         self.a_crop = self._action("✂ Обрезка", self.toggle_crop, "C", "Обрезка и горизонт: рамка на кадре")
         self.a_crop.setCheckable(True)
         tb.addAction(self.a_crop)
@@ -786,6 +829,27 @@ class MainWindow(QMainWindow):
         pl = QVBoxLayout(panel)
         self.hist = Histogram()
         pl.addWidget(self.hist)
+
+        box = QGroupBox("ИИ-цветокоррекция")
+        gl = QVBoxLayout(box)
+        b = QPushButton("🎨 Подобрать цвет по правилам (G)")
+        b.setToolTip("ИИ определяет сцену и объекты (кожа, небо, зелень, вода) и строит варианты:\n"
+                     "цвета памяти, гармонии цветового круга, тёплое/холодное, фигура и фон, 60-30-10, ч/б.\n"
+                     "Варианты — в карусели под кадром, щелчок применяет")
+        b.clicked.connect(self.start_grade)
+        gl.addWidget(b)
+        self.grade_rule = QLabel("Нажмите кнопку — под кадром появятся варианты")
+        self.grade_rule.setWordWrap(True)
+        self.grade_rule.setStyleSheet("color:#9a9a9a")
+        gl.addWidget(self.grade_rule)
+        self.grade_strength_row = SliderRow("grade_strength", "Сила", 0, 100)
+        self.grade_strength_row.set_value(80)
+        self.grade_strength_row.changed.connect(self.on_grade_strength)
+        gl.addWidget(self.grade_strength_row)
+        b = QPushButton("Убрать ИИ-цветокоррекцию")
+        b.clicked.connect(lambda: self.carousel.setCurrentRow(0) if self.carousel.count() else self.clear_grade())
+        gl.addWidget(b)
+        pl.addWidget(box)
 
         box = QGroupBox("Обрезка и горизонт")
         cl = QVBoxLayout(box)
@@ -1053,7 +1117,26 @@ class MainWindow(QMainWindow):
 
         split = QSplitter()
         split.addWidget(self.strip)
-        split.addWidget(self.view)
+        center = QWidget()
+        cvl2 = QVBoxLayout(center)
+        cvl2.setContentsMargins(0, 0, 0, 0)
+        cvl2.setSpacing(4)
+        cvl2.addWidget(self.view, 1)
+        self.carousel = QListWidget()
+        self.carousel.setViewMode(QListWidget.IconMode)
+        self.carousel.setFlow(QListWidget.LeftToRight)
+        self.carousel.setWrapping(False)
+        self.carousel.setMovement(QListWidget.Static)
+        self.carousel.setIconSize(QSize(168, 112))
+        self.carousel.setGridSize(QSize(184, 150))
+        self.carousel.setWordWrap(True)
+        self.carousel.setFixedHeight(172)
+        self.carousel.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.carousel.setToolTip("Варианты ИИ-цветокоррекции: щелчок — применить, ← → — листать")
+        self.carousel.currentRowChanged.connect(self.on_grade_pick)
+        self.carousel.hide()
+        cvl2.addWidget(self.carousel)
+        split.addWidget(center)
         split.addWidget(scroll)
         split.setStretchFactor(1, 1)
         split.setSizes([240, 950, 320])
@@ -1076,7 +1159,7 @@ class MainWindow(QMainWindow):
         self.panel.setEnabled(on)
         for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_export,
                   self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100, self.a_scenes,
-                  self.a_undo, self.a_redo, self.a_crop):
+                  self.a_undo, self.a_redo, self.a_crop, self.a_grade):
             a.setEnabled(on)
         self.zoom_combo.setEnabled(on)
 
@@ -1201,6 +1284,10 @@ class MainWindow(QMainWindow):
         self.request_render()
         self.refresh_look_icons()
         self.ensure_ai_masks()
+        if self.carousel.isVisible():  # карусель открыта — варианты сразу для нового кадра
+            self.grade_variants = []
+            self.carousel.clear()
+            self.start_grade()
 
     def on_error(self, msg):
         self.view.message = f"Не получилось открыть кадр:\n{msg}"
@@ -1228,6 +1315,7 @@ class MainWindow(QMainWindow):
             row.set_value(self.params.get(key, 0))
         self.angle_row.set_value(round(self.params.get("angle", 0) * 10))
         self.curve.set_curves(self.params.get("curve"))
+        self._sync_grade()
         hsl = self.params.get("hsl") or {}
         for (color, idx), r in self.hsl_rows.items():
             r.set_value(hsl.get(color, [0, 0, 0])[idx])
@@ -1422,6 +1510,94 @@ class MainWindow(QMainWindow):
         for r in self.hsl_rows.values():
             r.set_value(0)
         self.request_render()
+
+    # ---------- ИИ-цветокоррекция: карусель вариантов
+
+    def start_grade(self):
+        if self.base is None:
+            return
+        self.carousel.show()
+        if self.grade_busy:
+            return
+        self.grade_busy = True
+        name = self.current.name
+        maps = {c: self.ai_arr(name, c) for c in GR.MASK_CATS}
+        scene = (self.scene_of.get(name) or [None])[0]
+        first = self.segmenter is None and G.available() and any(m is None for m in maps.values())
+        self.toast("ИИ смотрит на кадр: объекты, цвета, гармонии…"
+                   + (" В первый раз загружаются модели" if first else ""), 0)
+        run_task(grade_job, self.segmenter, self.classifier, self.scene_defs, self.current, self.base,
+                 self.render_params(), self.current_style(), self.current_look(), self.display_geo(), maps, scene,
+                 self.thumbs.get(name), done=self.on_graded, fail=self.on_grade_fail)
+
+    def on_graded(self, res):
+        seg, clf, path, new, scene, an, vs, thumbs = res
+        self.grade_busy = False
+        self.segmenter, self.classifier = seg or self.segmenter, clf or self.classifier
+        for cat, arr in new.items():
+            self.ai_cache[(path.name, cat)] = arr
+            try:
+                _write_png(path.parent / MASKS_DIR / f"{path.name}.{cat}.png", arr)
+            except OSError as e:
+                self.toast(f"Не удалось сохранить маску: {e}", 8000)
+        if scene and path.name not in self.scene_of:
+            self.scene_of[path.name] = [scene, 0.0]
+            self.update_item(path.name)
+        if path != self.current:  # пока считали, открыли другой кадр
+            self.start_grade()
+            return
+        self.grade_variants = vs
+        c = self.carousel
+        c.blockSignals(True)
+        c.clear()
+        for i, th in enumerate(thumbs):
+            it = QListWidgetItem(QIcon(QPixmap.fromImage(to_qimage(th))), "Исходный" if i == 0 else vs[i - 1]["name"])
+            it.setToolTip("Без ИИ-цветокоррекции" if i == 0 else vs[i - 1]["rule"])
+            c.addItem(it)
+        c.blockSignals(False)
+        self._sync_grade()
+        found = [GR.LABELS.get(r, "") for r in an["regions"] if r in GR.LABELS]
+        sc = self.scene_by_id.get(scene or "", {}).get("name", "не определена")
+        self.toast(f"Вариантов: {len(vs)}. Сцена: {sc.lower()}. Найдено: {', '.join(found) or 'без масок объектов'}."
+                   " Щёлкайте по карусели под кадром", 10000)
+
+    def on_grade_fail(self, msg):
+        self.grade_busy = False
+        self.toast(f"ИИ-цветокоррекция не получилась: {msg}", 10000)
+
+    def on_grade_pick(self, row: int):
+        if row < 0 or self.base is None:
+            return
+        if row == 0 or row - 1 >= len(self.grade_variants):
+            self.clear_grade()
+            return
+        v = self.grade_variants[row - 1]
+        self.params["ai_grade"] = {**copy.deepcopy(v), "strength": self.grade_strength_row.slider.value()}
+        self.grade_rule.setText(f"<b>{v['name']}</b><br>{v['rule']}")
+        self.request_render()
+
+    def clear_grade(self):
+        self.params["ai_grade"] = None
+        self.grade_rule.setText("Без ИИ-цветокоррекции")
+        self.request_render()
+
+    def on_grade_strength(self, _key: str, value: int):
+        g = self.params.get("ai_grade")
+        if g:
+            self.params["ai_grade"] = {**g, "strength": value}
+            self.request_render()
+
+    def _sync_grade(self):
+        g = self.params.get("ai_grade")
+        self.grade_strength_row.set_value(g.get("strength", 80) if g else self.grade_strength_row.slider.value())
+        if g:
+            self.grade_rule.setText(f"<b>{g['name']}</b><br>{g.get('rule', '')}")
+        row = 0
+        if g:
+            row = next((i + 1 for i, v in enumerate(self.grade_variants) if v["id"] == g["id"]), -1)
+        self.carousel.blockSignals(True)
+        self.carousel.setCurrentRow(row if self.carousel.count() else -1)
+        self.carousel.blockSignals(False)
 
     # ---------- целевая правка (тянуть по цвету/тону прямо на кадре)
 
@@ -1756,7 +1932,12 @@ class MainWindow(QMainWindow):
             if c["type"] == "ai":
                 c["arr"] = self.ai_arr(name, c["cat"])
             layers.append(c)
-        return {**p, "masks": layers}
+        out = {**p, "masks": layers}
+        grade = p.get("ai_grade")
+        if grade and grade.get("masks"):
+            out["ai_grade"] = {**grade, "masks": [{**copy.deepcopy(m), "arr": self.ai_arr(name, m["cat"])}
+                                                  for m in grade["masks"]]}
+        return out
 
     def refresh_mask_list(self, select: int | None = None):
         layers = self.masks()
@@ -1882,7 +2063,8 @@ class MainWindow(QMainWindow):
 
     def ensure_ai_masks(self):
         """У кадра есть ИИ-слои без готовой маски (например, после вставки правок) — досчитать в фоне."""
-        cats = sorted({m["cat"] for m in self.masks() if m["type"] == "ai"
+        layers = self.masks() + list((self.params.get("ai_grade") or {}).get("masks", []))
+        cats = sorted({m["cat"] for m in layers if m["type"] == "ai"
                        and self.ai_arr(self.current.name, m["cat"]) is None})
         if cats and G.available():
             run_task(segment_job, self.segmenter, self.current, self.base, cats, False,
@@ -2255,7 +2437,8 @@ class MainWindow(QMainWindow):
         self.save_sidecar()
         missing = []
         for p in paths:
-            layers = E.normalize_params(self.sidecar.get(p.name, self.params)).get("masks", [])
+            fp = E.normalize_params(self.sidecar.get(p.name, self.params))
+            layers = fp.get("masks", []) + list((fp.get("ai_grade") or {}).get("masks", []))
             cats = sorted({m["cat"] for m in layers if m["type"] == "ai" and self.ai_arr(p.name, m["cat"]) is None})
             if cats:
                 missing.append((str(p), cats))

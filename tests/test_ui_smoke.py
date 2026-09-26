@@ -267,6 +267,39 @@ if __name__ == "__main__":
         win.reset_curve()
         wait(app, lambda: not win.rendering and not win.dirty)
 
+        # ИИ-цветокоррекция: карусель на готовых масках (без скачивания моделей)
+        from mini_lightroom import grading as GR
+        hh, ww = win.base.shape[:2]
+        fake = {c: np.zeros((hh, ww), np.uint8) for c in GR.MASK_CATS}
+        fake["sky"][: hh // 3] = 255
+        fake["people"][hh // 3: hh * 2 // 3, ww // 3: ww * 2 // 3] = 255
+        for c, m in fake.items():
+            ui._write_png(d / ui.MASKS_DIR / f"{win.current.name}.{c}.png", m)
+            win.ai_cache.pop((win.current.name, c), None)
+        win.scene_of[win.current.name] = ["portrait", 0.9]
+        win.start_grade()
+        wait(app, lambda: not win.grade_busy and win.carousel.count() > 1, 120)
+        assert win.carousel.isVisible() and win.carousel.count() == len(win.grade_variants) + 1
+        win.carousel.setCurrentRow(1)
+        assert win.params["ai_grade"]["id"] == win.grade_variants[0]["id"]
+        win.grade_strength_row.slider.setValue(40)
+        assert win.params["ai_grade"]["strength"] == 40
+        subj = next(i for i, vv in enumerate(win.grade_variants) if vv["id"] == "subject")
+        win.carousel.setCurrentRow(subj + 1)
+        rp = win.render_params()["ai_grade"]
+        assert rp["masks"] and all(m["arr"] is not None for m in rp["masks"]), "маски варианта без данных"
+        assert "arr" not in win.params["ai_grade"]["masks"][0], "массив маски попал в правки"
+        wait(app, lambda: not win.rendering and not win.dirty)
+        win.commit_history()
+        win.carousel.setCurrentRow(0)
+        assert win.params["ai_grade"] is None
+        win.commit_history()
+        win.undo()
+        assert win.params["ai_grade"]["id"] == "subject" and win.carousel.currentRow() == subj + 1
+        win.carousel.setCurrentRow(0)
+        win.carousel.hide()
+        wait(app, lambda: not win.rendering and not win.dirty)
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))

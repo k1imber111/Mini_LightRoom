@@ -48,7 +48,8 @@ def default_params() -> dict:
     p.update(style="", style_strength=70, style_tone=70, style_skin=60, style_mode=0, style2="", style_mix=50,
              look="", look_strength=100, masks=[],
              crop=None, angle=0.0,  # обрезка [x0, y0, x1, y1] в долях повёрнутого кадра, поворот в градусах
-             hsl={}, curve={})  # HSL: {цвет: [оттенок, насыщ., яркость]}; кривая: {"rgb"|"r"|"g"|"b": точки 0..255}
+             hsl={}, curve={},
+             ai_grade=None)  # ИИ-цветокоррекция (grading.py): {"id","name","rule","recipe","masks","strength"}  # HSL: {цвет: [оттенок, насыщ., яркость]}; кривая: {"rgb"|"r"|"g"|"b": точки 0..255}
     return p
 
 
@@ -436,14 +437,22 @@ def process(img: np.ndarray, p: dict, style: dict | None = None,
     if hsl:
         img = _apply_hsl(np.clip(img, 0, 1).astype(np.float32), hsl)
 
+    grade = p.get("ai_grade") or {}
+    g_amount = grade.get("strength", 80) / 100 if grade else 0.0
+    if grade.get("recipe") and g_amount > 0:  # ИИ-цветокоррекция: рецепт поверх ваших правок, до стиля
+        img = apply_look(img, grade["recipe"], g_amount)
+
     if style:
         img = _apply_style(np.clip(img, 0, 1), style, p, src_stats)
 
     if look:  # образ — финальный цвет, поверх стиля; виньетка и резкость уже после него
         img = apply_look(img, look, p.get("look_strength", 100) / 100.0)
 
-    if local and p.get("masks"):  # маски пространственные: в LUT не попадают
-        img = apply_masks(np.clip(img, 0, 1), p["masks"], (fw, fh, x0, y0))
+    layers = list(p.get("masks") or [])
+    if g_amount > 0:  # объектные правки ИИ-цветокоррекции — те же маски, с силой варианта
+        layers += [{**lay, "amount": g_amount} for lay in grade.get("masks", [])]
+    if local and layers:  # маски пространственные: в LUT не попадают
+        img = apply_masks(np.clip(img, 0, 1), layers, (fw, fh, x0, y0))
 
     if local:
         v = g("vignette")
@@ -471,6 +480,9 @@ def apply_masks(img: np.ndarray, layers: list, frame: tuple) -> np.ndarray:
         m = M.layer_mask(layer, h, w, frame)
         if m is None or m.max() < 1e-3:
             continue
+        m = m * layer.get("amount", 1.0)
+        if layer.get("protect_white"):  # выбитое в белый (солнце) не затемняем в грязно-серое пятно
+            m = m * (1 - np.clip((img.max(-1) - 0.9) / 0.08, 0, 1))
         local = process(img, {**default_params(), **adj}, frame=frame)
         img = img + (local - img) * m[..., None]
     return img

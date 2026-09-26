@@ -130,6 +130,45 @@ assert wts[list(E.HSL_CENTERS).index("green")] == 1 and wts.sum() <= 1
 w45 = E.hsl_weights(45)
 assert abs(w45[1] - w45[2]) < 1e-6 and w45.sum() <= 1 + 1e-6, "оранжево-жёлтый делится поровну"
 
+# ИИ-цветокоррекция: «Естественные цвета» ведут кожу, зелень и небо к эталонам цветов памяти.
+from mini_lightroom import grading as GR  # noqa: E402
+
+
+def lab_fill(L, C, h, shape):
+    lab = np.zeros(shape + (3,), np.float32)
+    lab[..., 0], lab[..., 1], lab[..., 2] = L, C * np.cos(np.radians(h)), C * np.sin(np.radians(h))
+    return np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2RGB), 0, 1)
+
+
+gi = np.full((300, 450, 3), 0.5, np.float32)
+gi[:100] = lab_fill(70, 30, 285, (100, 450))
+gi[100:220, :200] = lab_fill(50, 35, 135, (120, 200))
+gi[100:220, 250:400] = lab_fill(65, 24, 32, (120, 150))
+gseg = {k: np.zeros((300, 450), np.float32) for k in GR.MASK_CATS}
+gseg["sky"][:100] = 1
+gseg["greenery"][100:220, :200] = 1
+gseg["people"][100:220, 250:400] = 1
+an0 = GR.analyze(gi, gseg, "landscape")
+vs = GR.variants(an0)
+assert {"natural", "complementary", "analogous", "subject", "sky", "bw"} <= {v["id"] for v in vs}
+assert all(v["name"] and v["rule"] and isinstance(v["recipe"], dict) for v in vs)
+nat = next(v for v in vs if v["id"] == "natural")
+glayers = [{**m, "arr": (gseg[m["cat"]] * 255).astype(np.uint8)} for m in nat["masks"]]
+gout = E.process(gi, {**E.default_params(), "ai_grade": {**nat, "masks": glayers, "strength": 100}})
+an1 = GR.analyze(gout, gseg, "landscape")
+for reg in ("skin", "greenery", "sky"):
+    d0 = abs(GR._ang(GR.MEMORY[reg]["h"], an0["regions"][reg]["h"]))
+    d1 = abs(GR._ang(GR.MEMORY[reg]["h"], an1["regions"][reg]["h"]))
+    print(f"ИИ-цвет, {reg}: до эталона {d0:.1f}° → {d1:.1f}°")
+    assert d1 < d0 - 5 or d1 < 3, f"{reg} не приблизился к эталону"
+assert abs(an1["regions"]["skin"]["h"] - 49) < 4, "кожа не на эталоне 49°"
+assert np.abs(E.process(gi, {**E.default_params(), "ai_grade": {**nat, "masks": glayers, "strength": 0}})
+              - E.process(gi, E.default_params())).max() < 1e-5, "сила 0 меняет кадр"
+sunset = GR.variants(GR.analyze(gi, gseg, "sunset"))
+assert "golden" not in {v["id"] for v in sunset}, "на закате не нужен «золотой свет»"
+assert not any(m["cat"] == "sky" for m in next(v for v in sunset if v["id"] == "natural")["masks"]), \
+    "закатное небо не тянем к голубому"
+
 # Обрезка и горизонт: последний шаг, одна матрица для превью, масштаба и экспорта.
 W0, H0 = 1500, 1000
 c169 = E.aspect_crop(W0, H0, 16 / 9)
