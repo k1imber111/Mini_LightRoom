@@ -11,16 +11,35 @@ from pathlib import Path
 
 import numpy as np
 
-__all__ = ["SceneClassifier", "available"]
+from .enhance import GPU_LOCK
+
+__all__ = ["SceneClassifier", "available", "get_classifier", "loaded"]
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # Windows без прав на симлинки — не шуметь
 
 MODEL, PRETRAINED = "ViT-B-32", "laion2b_s34b_b79k"
+HF_REPO = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"  # где лежат веса PRETRAINED
 
 
 def available() -> bool:
     """Установлены ли библиотеки ИИ."""
     return all(importlib.util.find_spec(m) is not None for m in ("torch", "open_clip"))
+
+
+_classifier = None
+
+
+def loaded() -> bool:
+    return _classifier is not None
+
+
+def get_classifier(scenes: list[dict], models_dir: Path) -> SceneClassifier:
+    """Одна модель на программу: загрузка под общим замком, повторные вызовы — готовая."""
+    global _classifier
+    with GPU_LOCK:
+        if _classifier is None:
+            _classifier = SceneClassifier(scenes, models_dir)
+    return _classifier
 
 
 class SceneClassifier:
@@ -32,8 +51,13 @@ class SceneClassifier:
 
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        from huggingface_hub import try_to_load_from_cache
+
+        # Веса уже в models/ — файлом, без обращений к сети (прокси может отвечать минутами).
+        local = try_to_load_from_cache(HF_REPO, "open_clip_model.safetensors", cache_dir=str(models_dir))
         model, _, self.preprocess = open_clip.create_model_and_transforms(
-            MODEL, pretrained=PRETRAINED, cache_dir=str(models_dir), device=self.device)
+            MODEL, pretrained=local if isinstance(local, str) else PRETRAINED, cache_dir=str(models_dir),
+            device=self.device)
         self.model = model.eval()
         if self.device == "cuda":
             self.model = self.model.half()
@@ -54,7 +78,7 @@ class SceneClassifier:
 
         torch = self.torch
         out: list[tuple[str, float]] = []
-        with torch.no_grad():
+        with GPU_LOCK, torch.no_grad():
             for i in range(0, len(images), batch):
                 x = torch.stack([self.preprocess(Image.fromarray(im)) for im in images[i:i + batch]]).to(self.device)
                 if self.device == "cuda":

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-__all__ = ["MODELS", "available", "denoise", "iso_of", "iso_strength", "upscale"]
+__all__ = ["GPU_LOCK", "MODELS", "available", "denoise", "iso_of", "iso_strength", "upscale"]
 
 MODELS = {
     "denoise": ("scunet_color_real_psnr.pth",
@@ -27,7 +27,9 @@ MODELS = {
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 _models: dict = {}
-_lock = threading.Lock()  # одна видеокарта: окно может звать из нескольких потоков
+# Один замок на всё, что трогает torch (здесь, в segment.py и scene.py): импорт torch/transformers/open_clip
+# из двух потоков сразу взаимно блокирует импорт модулей, и программа висит навсегда.
+GPU_LOCK = threading.RLock()
 
 
 def available() -> bool:
@@ -111,7 +113,7 @@ def denoise(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     if strength <= 0:
         return img
     src = np.clip(img, 0, 1).astype(np.float32)
-    with _lock:
+    with GPU_LOCK:
         clean = _run_tiled(src, "denoise")
     return src + (clean - src) * min(strength, 1.0)
 
@@ -120,5 +122,5 @@ def upscale(img: np.ndarray, factor: int) -> np.ndarray:
     """Увеличение ×2 или ×4 (Real-ESRGAN)."""
     if factor not in (2, 4):
         return img
-    with _lock:
+    with GPU_LOCK:
         return _run_tiled(np.clip(img, 0, 1).astype(np.float32), f"x{factor}")

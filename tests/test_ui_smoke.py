@@ -305,6 +305,7 @@ if __name__ == "__main__":
         win.ai_thirds()
         assert win.params["crop"] is not None, "кадр по третям не обрезал"
         win.ai_horizon()  # на шуме горизонта нет — поворот не меняется
+        wait(app, lambda: not ui._alive)
         assert win.params.get("angle", 0) == 0
         win.reset_crop()
         wait(app, lambda: not win.rendering and not win.dirty)

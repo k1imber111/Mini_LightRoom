@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import os
 import statistics
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -125,8 +125,14 @@ class _Task(QRunnable):
 
 _alive: set = set()
 
+# Всё, что трогает torch, — строго по очереди в ОДНОМ постоянном потоке Python. В потоках QThreadPool
+# torch нельзя: PySide после каждой задачи уничтожает состояние Python-потока, а torch (pybind11)
+# держит на него указатель — второй вызов torch в том же потоке Qt вешал программу или ронял её
+# (0xc0000374). Так и получалось «нажал две-три ИИ-функции — всё встало».
+AI_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai")
 
-def run_task(fn, *args, done=None, fail=None, pool: QThreadPool | None = None):
+
+def run_task(fn, *args, done=None, fail=None, pool: QThreadPool | Executor | None = None):
     t = _Task(fn, args)
     _alive.add(t)
     if done:
@@ -135,7 +141,10 @@ def run_task(fn, *args, done=None, fail=None, pool: QThreadPool | None = None):
         t.sig.fail.connect(fail)
     t.sig.done.connect(lambda *_: _alive.discard(t))
     t.sig.fail.connect(lambda *_: _alive.discard(t))
-    (pool or QThreadPool.globalInstance()).start(t)
+    if isinstance(pool, Executor):
+        pool.submit(t.run)  # сигналы из потока Python приходят в окно очередью, как из QThreadPool
+    else:
+        (pool or QThreadPool.globalInstance()).start(t)
 
 
 def aspect_label(a: float) -> str:
@@ -187,10 +196,8 @@ def look_icons_job(path, base, params, style, looks):
     return path, {name: to_u8(E.apply_look(small, look)) for name, look in looks.items()}
 
 
-def scene_job(classifier, scenes, names, thumbs):
-    if classifier is None:  # первый раз: загрузка модели (и скачивание весов)
-        classifier = S.SceneClassifier(scenes, MODELS_DIR)
-    return classifier, names, classifier.classify(thumbs)
+def scene_job(scenes, names, thumbs):
+    return names, S.get_classifier(scenes, MODELS_DIR).classify(thumbs)
 
 
 def style_job(path, name):
@@ -203,22 +210,18 @@ def _seg_input(base):
     return E.process(base, E.normalize_params(E.auto_params(base)))
 
 
-def segment_job(segmenter, path, base, cats, create):
-    if segmenter is None:  # первый раз: загрузка модели (и скачивание весов)
-        segmenter = G.Segmenter(MODELS_DIR)
-    maps = segmenter.masks(_seg_input(base), cats)
-    return segmenter, path, {c: (m * 255 + 0.5).astype(np.uint8) for c, m in maps.items()}, create
+def segment_job(path, base, cats, create):
+    maps = G.get_segmenter(MODELS_DIR).masks(_seg_input(base), cats)
+    return path, {c: (m * 255 + 0.5).astype(np.uint8) for c, m in maps.items()}, create
 
 
-def prepare_ai_job(segmenter, items, out_dir):
+def prepare_ai_job(items, out_dir):
     """ИИ-маски для кадров, которые ещё не открывали (перед экспортом)."""
-    if segmenter is None:
-        segmenter = G.Segmenter(MODELS_DIR)
+    segmenter = G.get_segmenter(MODELS_DIR)
     for path, cats in items:
         base = E.load_image(path, half=True, max_side=PREVIEW_SIDE)
         for cat, m in segmenter.masks(_seg_input(base), cats).items():
             _write_png(Path(out_dir) / f"{Path(path).name}.{cat}.png", (m * 255 + 0.5).astype(np.uint8))
-    return segmenter
 
 
 def _write_png(path: Path, arr: np.ndarray):
@@ -226,21 +229,17 @@ def _write_png(path: Path, arr: np.ndarray):
     path.write_bytes(cv2.imencode(".png", arr)[1].tobytes())  # через Python: кириллица в пути
 
 
-def grade_job(segmenter, classifier, scene_defs, path, base, params, style, look, geo, maps, scene, thumb):
+def grade_job(scene_defs, path, base, params, style, look, geo, maps, scene, thumb):
     """ИИ-цветокоррекция: маски объектов → сцена → анализ цвета → варианты по правилам → миниатюры карусели."""
     new = {}
     if G.available():
         missing = [c for c in GR.MASK_CATS if maps.get(c) is None]
         if missing:
-            if segmenter is None:
-                segmenter = G.Segmenter(MODELS_DIR)
-            for c, m in segmenter.masks(_seg_input(base), missing).items():
+            for c, m in G.get_segmenter(MODELS_DIR).masks(_seg_input(base), missing).items():
                 new[c] = (m * 255 + 0.5).astype(np.uint8)
     allm = {**{c: m for c, m in maps.items() if m is not None}, **new}
     if scene is None and thumb is not None and S.available():
-        if classifier is None:
-            classifier = S.SceneClassifier(scene_defs, MODELS_DIR)
-        scene = classifier.classify([thumb])[0][0]
+        scene = S.get_classifier(scene_defs, MODELS_DIR).classify([thumb])[0][0]
     small = E.resize_max(base, 512)
     pre = E.process(small, {**params, "ai_grade": None, "style": "", "look": "", "masks": []})
     seg = {c: cv2.resize(m, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
@@ -259,7 +258,15 @@ def grade_job(segmenter, classifier, scene_defs, path, base, params, style, look
         return to_u8(E.apply_crop(E.process(tiny, p, style, look=look), crop, angle, full))
 
     thumbs = [render(None)] + [render(v) for v in vs]
-    return segmenter, classifier, path, new, scene, an, vs, thumbs
+    return path, new, scene, an, vs, thumbs
+
+
+def horizon_job(path, base, sky):
+    return path, E.auto_horizon(_seg_input(base), sky)
+
+
+def saliency_job(path, base):
+    return path, E.saliency_point(_seg_input(base))
 
 
 def full_job(path):
@@ -699,8 +706,6 @@ class MainWindow(QMainWindow):
         self.scene_defs: list[dict] = E.read_json(SCENES_FILE, [])
         self.scene_by_id = {sc["id"]: sc for sc in self.scene_defs}
         self.scene_of: dict[str, list] = {}
-        self.classifier = None
-        self.segmenter = None
         self.isos: dict[str, int | None] = {}
         self.base_dn: np.ndarray | None = None   # превью текущего кадра без шума (полная сила)
         self.dn_busy = False
@@ -1479,7 +1484,8 @@ class MainWindow(QMainWindow):
         rp = self.render_params()
         rp["crop"] = self.display_geo()[0]
         run_task(detail_job, self.detail_gen, self.full, self.base, rect, min(1.0, v.scale()),
-                 rp, self.current_style(), self.current_look(), done=self.on_detail, fail=self.on_detail_fail)
+                 rp, self.current_style(), self.current_look(), done=self.on_detail, fail=self.on_detail_fail,
+                 pool=AI_POOL if rp.get("denoise") and N.available() else None)  # шумодав — это torch
 
     def on_full(self, res):
         path, img = res
@@ -1572,8 +1578,14 @@ class MainWindow(QMainWindow):
     def ai_horizon(self):
         if self.base is None:
             return
-        img = _seg_input(self.base)
-        ang = E.auto_horizon(img, self._mask01("sky"))
+        self.toast("ИИ ищет горизонт…", 0)
+        run_task(horizon_job, self.current, self.base, self._mask01("sky"), done=self.on_horizon,
+                 fail=lambda m: self.toast(f"Горизонт не найден: {m}", 8000))
+
+    def on_horizon(self, res):
+        path, ang = res
+        if path != self.current:
+            return
         if ang is None:
             self.toast("Не нашёл уверенного горизонта или вертикалей — выровняйте ползунком «Горизонт»", 8000)
             return
@@ -1590,16 +1602,22 @@ class MainWindow(QMainWindow):
             missing = [c for c, m in (("people", people), ("sky", sky)) if m is None]
             self._after_seg = self.ai_thirds
             self.toast("ИИ ищет людей и небо на кадре…", 0)
-            run_task(segment_job, self.segmenter, self.current, self.base, missing, False,
+            run_task(segment_job, self.current, self.base, missing, False, pool=AI_POOL,
                      done=self.on_segmented, fail=lambda m: (setattr(self, "_after_seg", None),
                                                              self.toast(f"Маски не получились: {m}", 8000)))
             return
+        pt = E.subject_point(people)
+        if pt is not None:
+            self._apply_thirds(pt, "человек", None)
+            return
+        self.toast("ИИ ищет главное в кадре…", 0)
+        run_task(saliency_job, self.current, self.base, fail=lambda m: self.toast(f"Не получилось: {m}", 8000),
+                 done=lambda r: r[0] == self.current and self._apply_thirds(r[1], "самое заметное место",
+                                                                            E.horizon_level(sky)))
+
+    def _apply_thirds(self, pt: tuple, what: str, horizon: float | None):
         W, H = self.full_wh
         angle = self.params.get("angle", 0)
-        pt, what, horizon = E.subject_point(people), "человек", None
-        if pt is None:
-            pt, what = E.saliency_point(_seg_input(self.base)), "самое заметное место"
-            horizon = E.horizon_level(sky)
         A, _ = E.crop_matrix(W, H, None, angle)  # точка полного кадра → повёрнутый холст, где живёт рамка
         rx, ry = A @ (pt[0] * W, pt[1] * H, 1.0)
         crop = self.params.get("crop")
@@ -1629,17 +1647,16 @@ class MainWindow(QMainWindow):
         name = self.current.name
         maps = {c: self.ai_arr(name, c) for c in GR.MASK_CATS}
         scene = (self.scene_of.get(name) or [None])[0]
-        first = self.segmenter is None and G.available() and any(m is None for m in maps.values())
+        first = not G.loaded() and G.available() and any(m is None for m in maps.values())
         self.toast("ИИ смотрит на кадр: объекты, цвета, гармонии…"
                    + (" В первый раз загружаются модели" if first else ""), 0)
-        run_task(grade_job, self.segmenter, self.classifier, self.scene_defs, self.current, self.base,
+        run_task(grade_job, self.scene_defs, self.current, self.base,
                  self.render_params(), self.current_style(), self.current_look(), self.display_geo(), maps, scene,
-                 self.thumbs.get(name), done=self.on_graded, fail=self.on_grade_fail)
+                 self.thumbs.get(name), done=self.on_graded, fail=self.on_grade_fail, pool=AI_POOL)
 
     def on_graded(self, res):
-        seg, clf, path, new, scene, an, vs, thumbs = res
+        path, new, scene, an, vs, thumbs = res
         self.grade_busy = False
-        self.segmenter, self.classifier = seg or self.segmenter, clf or self.classifier
         for cat, arr in new.items():
             self.ai_cache[(path.name, cat)] = arr
             try:
@@ -1996,7 +2013,8 @@ class MainWindow(QMainWindow):
             return
         self.dn_busy = True
         self.toast("Шумодав: считаю превью… (в первый раз загружается модель)", 0)
-        run_task(denoise_job, self.current, self.base, done=self.on_denoised, fail=self.on_denoise_fail)
+        run_task(denoise_job, self.current, self.base, done=self.on_denoised, fail=self.on_denoise_fail,
+                 pool=AI_POOL)
 
     def on_denoised(self, res):
         path, dn = res
@@ -2164,9 +2182,9 @@ class MainWindow(QMainWindow):
         if self.ai_arr(self.current.name, cat) is not None:
             self._create_ai_layer(cat)
             return
-        first = self.segmenter is None
+        first = not G.loaded()
         self.toast(f"Ищу «{label}» на кадре…" + (" В первый раз загружается модель (~110 МБ)" if first else ""), 0)
-        run_task(segment_job, self.segmenter, self.current, self.base, [cat], True,
+        run_task(segment_job, self.current, self.base, [cat], True, pool=AI_POOL,
                  done=self.on_segmented, fail=lambda m: self.toast(f"Маска ИИ не получилась: {m}", 10000))
 
     def ensure_ai_masks(self):
@@ -2175,11 +2193,11 @@ class MainWindow(QMainWindow):
         cats = sorted({m["cat"] for m in layers if m["type"] == "ai"
                        and self.ai_arr(self.current.name, m["cat"]) is None})
         if cats and G.available():
-            run_task(segment_job, self.segmenter, self.current, self.base, cats, False,
+            run_task(segment_job, self.current, self.base, cats, False, pool=AI_POOL,
                      done=self.on_segmented, fail=lambda m: self.toast(f"Маска ИИ не получилась: {m}", 10000))
 
     def on_segmented(self, res):
-        self.segmenter, path, maps, create = res
+        path, maps, create = res
         for cat, arr in maps.items():
             self.ai_cache[(path.name, cat)] = arr
             try:
@@ -2240,14 +2258,14 @@ class MainWindow(QMainWindow):
             self.toast("Миниатюры ещё загружаются, попробуйте через пару секунд")
             return
         self.a_scenes.setEnabled(False)
-        first = self.classifier is None
+        first = not S.loaded()
         self.toast("Загружаю модель сцен (в первый раз скачивается ~600 МБ)…" if first
                    else f"Распознаю сцены: {len(names)} кадров…", 0)
-        run_task(scene_job, self.classifier, self.scene_defs, names, [self.thumbs[n] for n in names],
-                 done=self.on_scenes, fail=self.on_scenes_fail)
+        run_task(scene_job, self.scene_defs, names, [self.thumbs[n] for n in names],
+                 done=self.on_scenes, fail=self.on_scenes_fail, pool=AI_POOL)
 
     def on_scenes(self, res):
-        self.classifier, names, results = res
+        names, results = res
         self.a_scenes.setEnabled(True)
         counts: dict[str, int] = {}
         for n, (sid, prob) in zip(names, results):
@@ -2558,8 +2576,7 @@ class MainWindow(QMainWindow):
             self.toast(f"Готовлю маски ИИ для кадров: {len(missing)}…", 0)
             self.a_export.setEnabled(False)
 
-            def ready(seg):
-                self.segmenter = seg
+            def ready(_):
                 self._run_export(paths, opts)
 
             def failed(msg):
@@ -2567,7 +2584,8 @@ class MainWindow(QMainWindow):
                 self.toast(f"Маски ИИ не подготовлены ({msg}). Экспорт без них", 8000)
                 self._run_export(paths, opts)
 
-            run_task(prepare_ai_job, self.segmenter, missing, str(self.folder / MASKS_DIR), done=ready, fail=failed)
+            run_task(prepare_ai_job, missing, str(self.folder / MASKS_DIR), done=ready, fail=failed,
+                     pool=AI_POOL)
             return
         self._run_export(paths, opts)
 

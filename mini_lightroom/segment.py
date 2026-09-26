@@ -12,9 +12,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-__all__ = ["CATEGORIES", "Segmenter", "available", "refine"]
+from .enhance import GPU_LOCK
+
+__all__ = ["CATEGORIES", "Segmenter", "available", "get_segmenter", "loaded", "refine"]
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+# Без этого transformers после загрузки весов .bin запускает свой поток, который ходит в интернет за
+# конвертацией в safetensors и трогает torch мимо GPU_LOCK: с шумодавом подряд программа висла или падала.
+os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
 
 MODEL = "nvidia/segformer-b2-finetuned-ade-512-512"
 
@@ -30,6 +35,22 @@ CATEGORIES = {
 
 def available() -> bool:
     return all(importlib.util.find_spec(m) is not None for m in ("torch", "transformers"))
+
+
+_segmenter = None
+
+
+def loaded() -> bool:
+    return _segmenter is not None
+
+
+def get_segmenter(models_dir: Path) -> Segmenter:
+    """Одна модель на программу: загрузка под общим замком, повторные вызовы — готовая."""
+    global _segmenter
+    with GPU_LOCK:
+        if _segmenter is None:
+            _segmenter = Segmenter(models_dir)
+    return _segmenter
 
 
 def refine(prob: np.ndarray, guide_rgb: np.ndarray, radius: int | None = None, eps: float = 1e-3) -> np.ndarray:
@@ -48,24 +69,33 @@ def refine(prob: np.ndarray, guide_rgb: np.ndarray, radius: int | None = None, e
 class Segmenter:
     def __init__(self, models_dir: Path):
         import torch
-        from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
 
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.proc = SegformerImageProcessor.from_pretrained(MODEL, cache_dir=str(models_dir))
-        self.model = SegformerForSemanticSegmentation.from_pretrained(MODEL, cache_dir=str(models_dir))
+        try:  # веса уже в models/ — без обращений к сети (прокси может отвечать минутами)
+            self.proc, self.model = self._load(models_dir, True)
+        except OSError:  # первый запуск: скачать
+            self.proc, self.model = self._load(models_dir, False)
         self.model = self.model.to(self.device).eval()
         labels = {int(i): n.split(";")[0].split(",")[0].strip().lower()
                   for i, n in self.model.config.id2label.items()}
         self.ids = {cat: [i for i, n in labels.items() if n in names] for cat, (_, names) in CATEGORIES.items()}
+
+    @staticmethod
+    def _load(models_dir: Path, offline: bool):
+        from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+
+        kw = {"cache_dir": str(models_dir), "local_files_only": offline}
+        return (SegformerImageProcessor.from_pretrained(MODEL, **kw),
+                SegformerForSemanticSegmentation.from_pretrained(MODEL, **kw))
 
     def masks(self, rgb: np.ndarray, cats: list[str]) -> dict[str, np.ndarray]:
         """rgb float 0..1 (превью кадра) → {категория: мягкая маска 0..1 того же размера, края уточнены}."""
         torch = self.torch
         h, w = rgb.shape[:2]
         u8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-        inputs = self.proc(images=u8, return_tensors="pt").to(self.device)
-        with torch.no_grad():
+        with GPU_LOCK, torch.no_grad():
+            inputs = self.proc(images=u8, return_tensors="pt").to(self.device)
             logits = self.model(**inputs).logits
             logits = torch.nn.functional.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
             prob = logits.softmax(dim=1)[0]
