@@ -707,6 +707,7 @@ class MainWindow(QMainWindow):
         self.cam_aspects: dict[str, float | None] = {}
         self.crop_mode = False
         self.crop_backup: dict | None = None
+        self._after_seg = None  # что сделать, когда досчитаются маски (кадр по третям)
         self.grade_variants: list[dict] = []
         self.grade_busy = False
         self.target_mode: str | None = None
@@ -870,6 +871,18 @@ class MainWindow(QMainWindow):
         self.angle_row.setToolTip("Поворот для выравнивания горизонта. Рамка сама сжимается, чтобы не было пустых углов")
         self.angle_row.changed.connect(lambda _k, v: self.on_angle(v / 10))
         cl.addWidget(self.angle_row)
+        row = QHBoxLayout()
+        b = QPushButton("🤖 Выровнять горизонт")
+        b.setToolTip("ИИ ищет горизонт, границу неба и вертикали зданий и выравнивает кадр.\n"
+                     "Если линии противоречат друг другу — ничего не поворачивает")
+        b.clicked.connect(self.ai_horizon)
+        row.addWidget(b)
+        b = QPushButton("🤖 Кадр по третям")
+        b.setToolTip("Правило третей: главный объект (голова человека или самое заметное место)\n"
+                     "встаёт на пересечение третей, горизонт — на треть по высоте")
+        b.clicked.connect(self.ai_thirds)
+        row.addWidget(b)
+        cl.addLayout(row)
         row = QHBoxLayout()
         self.crop_cam = QCheckBox("Новые кадры — как в камере")
         self.crop_cam.setChecked(True)
@@ -1511,6 +1524,60 @@ class MainWindow(QMainWindow):
             r.set_value(0)
         self.request_render()
 
+    # ---------- ИИ-композиция: горизонт и трети
+
+    def _mask01(self, cat: str) -> np.ndarray | None:
+        arr = self.ai_arr(self.current.name, cat) if self.current else None
+        return None if arr is None else arr.astype(np.float32) / 255
+
+    def ai_horizon(self):
+        if self.base is None:
+            return
+        img = _seg_input(self.base)
+        ang = E.auto_horizon(img, self._mask01("sky"))
+        if ang is None:
+            self.toast("Не нашёл уверенного горизонта или вертикалей — выровняйте ползунком «Горизонт»", 8000)
+            return
+        ang = float(np.clip(ang, -45, 45))
+        self.angle_row.set_value(round(ang * 10))
+        self.on_angle(ang)
+        self.toast("Горизонт уже ровный" if ang == 0 else f"Горизонт выровнен: {ang:+.1f}°. Ctrl+Z — вернуть")
+
+    def ai_thirds(self):
+        if self.base is None:
+            return
+        people, sky = self._mask01("people"), self._mask01("sky")
+        if (people is None or sky is None) and G.available() and self._after_seg is None:
+            missing = [c for c, m in (("people", people), ("sky", sky)) if m is None]
+            self._after_seg = self.ai_thirds
+            self.toast("ИИ ищет людей и небо на кадре…", 0)
+            run_task(segment_job, self.segmenter, self.current, self.base, missing, False,
+                     done=self.on_segmented, fail=lambda m: (setattr(self, "_after_seg", None),
+                                                             self.toast(f"Маски не получились: {m}", 8000)))
+            return
+        W, H = self.full_wh
+        angle = self.params.get("angle", 0)
+        pt, what, horizon = E.subject_point(people), "человек", None
+        if pt is None:
+            pt, what = E.saliency_point(_seg_input(self.base)), "самое заметное место"
+            horizon = E.horizon_level(sky)
+        A, _ = E.crop_matrix(W, H, None, angle)  # точка полного кадра → повёрнутый холст, где живёт рамка
+        rx, ry = A @ (pt[0] * W, pt[1] * H, 1.0)
+        crop = self.params.get("crop")
+        if crop:
+            aspect = (crop[2] - crop[0]) * W / ((crop[3] - crop[1]) * H)
+        else:
+            aspect = self.cam_aspects.get(self.current.name) if self._cam_differs(self.current.name) else W / H
+        rect = E.thirds_crop(W, H, aspect, angle, (rx / W, ry / H), horizon, sure=what == "человек")
+        if self.crop_mode:
+            self.cropper.rect = rect
+            self.view.update()
+        self._set_crop(rect)
+        self.update_geometry()
+        self.request_render()
+        self.toast(f"Правило третей: {what} на пересечении третей" + (", горизонт на трети" if horizon else "")
+                   + ". Ctrl+Z — вернуть", 8000)
+
     # ---------- ИИ-цветокоррекция: карусель вариантов
 
     def start_grade(self):
@@ -2079,6 +2146,10 @@ class MainWindow(QMainWindow):
             except OSError as e:
                 self.toast(f"Не удалось сохранить маску: {e}", 8000)
         if path != self.current:
+            return
+        if self._after_seg:
+            then, self._after_seg = self._after_seg, None
+            then()
             return
         if create:
             for cat in maps:

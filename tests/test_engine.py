@@ -169,6 +169,29 @@ assert "golden" not in {v["id"] for v in sunset}, "на закате не нуж
 assert not any(m["cat"] == "sky" for m in next(v for v in sunset if v["id"] == "natural")["masks"]), \
     "закатное небо не тянем к голубому"
 
+# ИИ-композиция: выравнивание горизонта и правило третей.
+hy, hx = np.mgrid[0:600, 0:900]
+for tilt in (3.0, -2.0):
+    sea = np.full((600, 900, 3), 0.55, np.float32) + np.random.default_rng(5).normal(0, 0.02, (600, 900, 3)).astype(
+        np.float32)
+    sea[hy > 270 + (hx - 450) * np.tan(np.radians(tilt))] *= 0.4
+    fix = E.auto_horizon(np.clip(sea, 0, 1))
+    print(f"горизонт: наклон {tilt:+.1f}° → поворот {fix}")
+    assert fix is not None and abs(fix + tilt) < 0.3, "горизонт выровнен не туда"
+assert E.auto_horizon(np.random.default_rng(6).random((600, 900, 3)).astype(np.float32)) is None, "шум ≠ горизонт"
+person = np.zeros((600, 900), np.float32)
+person[250:560, 430:520] = 1
+head = E.subject_point(person)
+tc = E.thirds_crop(900, 600, 1.5, 0, head)
+fx, fy = (head[0] - tc[0]) / (tc[2] - tc[0]), (head[1] - tc[1]) / (tc[3] - tc[1])
+assert min(abs(fx - 1 / 3), abs(fx - 2 / 3)) < 0.03 and min(abs(fy - 1 / 3), abs(fy - 2 / 3)) < 0.03, (fx, fy)
+tiny = np.zeros((600, 900), np.float32)
+tiny[100:110, 100:105] = 1
+assert E.subject_point(tiny) is None, "прохожий на 0.01% кадра — не главный объект"
+low_sky = np.zeros((600, 900), np.float32)
+low_sky[:80] = 1
+assert E.horizon_level(low_sky) is None, "горизонт у края кадра не тянем на треть"
+
 # Обрезка и горизонт: последний шаг, одна матрица для превью, масштаба и экспорта.
 W0, H0 = 1500, 1000
 c169 = E.aspect_crop(W0, H0, 16 / 9)

@@ -566,6 +566,114 @@ def apply_crop(img: np.ndarray, crop, angle: float, full_size=None) -> np.ndarra
                           flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
+# ---------------------------------------------------------------- ИИ-композиция: горизонт и трети
+
+def auto_horizon(img: np.ndarray, sky: np.ndarray | None = None) -> float | None:
+    """Угол поворота (для params["angle"]), выравнивающий горизонт и вертикали. None — нет уверенности.
+    Линии Хафа: почти горизонтальные (±12°) и почти вертикальные (здания), вес — длина; граница неба
+    из ИИ-маски — сильный дополнительный голос. Решение — взвешенная медиана при малом разбросе."""
+    small = resize_max(np.clip(img, 0, 1), 1000)
+    h, w = small.shape[:2]
+    gray = cv2.GaussianBlur((cv2.cvtColor(small, cv2.COLOR_RGB2GRAY) * 255).astype(np.uint8), (0, 0), 1.5)
+    edges = cv2.Canny(gray, 40, 120)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 720, threshold=60, minLineLength=max(w, h) // 8, maxLineGap=8)
+    angles, weights = [], []
+    for x1, y1, x2, y2 in (lines.reshape(-1, 4) if lines is not None else []):  # OpenCV 4: (N,1,4), 5: (N,4)
+        a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        a = (a + 90) % 180 - 90                      # направление линии в (−90, 90]
+        length = np.hypot(x2 - x1, y2 - y1)
+        if abs(a) <= 12:
+            angles.append(a)
+            weights.append(length)
+        elif abs(abs(a) - 90) <= 8:                  # вертикаль: наклон относительно отвеса, вес поменьше
+            angles.append(a - 90 if a > 0 else a + 90)
+            weights.append(length * 0.5)
+    if sky is not None and sky.mean() > 0.03:
+        m = cv2.resize(sky.astype(np.float32), (w, h), interpolation=cv2.INTER_AREA) > 0.5
+        cols = np.arange(0, w, 4)
+        ys = np.array([np.argmin(m[:, c]) if m[0, c] and not m[:, c].all() else -1 for c in cols])
+        ok = ys > 0
+        if ok.sum() > len(cols) * 0.5:
+            k, _ = np.polyfit(cols[ok], ys[ok], 1)  # граница неба: наклон прямой
+            angles.append(np.degrees(np.arctan(k)))
+            weights.append(w * 1.5)
+    if not angles or sum(weights) < max(w, h) * 0.4:
+        return None
+    a, wt = np.array(angles), np.array(weights)
+    order = np.argsort(a)
+    cum = np.cumsum(wt[order]) / wt.sum()
+    med = float(a[order][np.searchsorted(cum, 0.5)])
+    close = np.abs(a - med) < 1.5
+    if wt[close].sum() < wt.sum() * 0.5:  # голоса разошлись — лучше ничего не делать
+        return None
+    tilt = float(np.average(a[close], weights=wt[close]))
+    return 0.0 if abs(tilt) < 0.1 else round(-tilt, 1)  # линия вниз-вправо на a° → повернуть на −a°
+
+
+def saliency_point(img: np.ndarray) -> tuple[float, float]:
+    """Самое заметное место кадра (доли): локальный контраст + насыщенность, лёгкий приоритет центра."""
+    small = resize_max(np.clip(img, 0, 1), 256).astype(np.float32)
+    h, w = small.shape[:2]
+    lab = cv2.cvtColor(small, cv2.COLOR_RGB2Lab)
+    blur = cv2.GaussianBlur(lab, (0, 0), 8)
+    contrast = np.linalg.norm(lab - blur, axis=-1)
+    sat = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)[..., 1] * 30
+    yy, xx = np.mgrid[0:h, 0:w]
+    prior = np.exp(-(((xx / w - 0.5) ** 2 + (yy / h - 0.5) ** 2) / 0.18))
+    sal = cv2.GaussianBlur((contrast + sat) * (0.6 + 0.4 * prior), (0, 0), 6)
+    top = sal >= np.percentile(sal, 97)
+    return float(xx[top].mean() / w), float(yy[top].mean() / h)
+
+
+def subject_point(people: np.ndarray | None) -> tuple[float, float] | None:
+    """Точка главного человека (доли): верх его силуэта — там глаза, их и ставят на треть."""
+    if people is None or people.mean() < 0.015:  # прохожий на 1% кадра — ещё не главный объект
+        return None
+    m = (people > 0.5).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m)
+    if n < 2:
+        return None
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    y, bh = stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_HEIGHT]
+    ys, xs = np.nonzero((lab == i)[y:y + max(1, bh // 4)])  # верхняя четверть силуэта, x — по всему кадру
+    h, w = m.shape
+    return float(xs.mean() / w), float((ys.mean() + y) / h)
+
+
+def horizon_level(sky: np.ndarray | None) -> float | None:
+    """Где кончается небо (доля высоты): медиана по столбцам, где верх кадра — небо."""
+    if sky is None or sky.mean() < 0.05:
+        return None
+    m = sky > 0.5
+    h, w = m.shape
+    ys = [np.argmin(m[:, c]) for c in range(0, w, max(1, w // 200)) if m[0, c] and not m[:, c].all()]
+    level = float(np.median(ys) / h) if len(ys) > 10 else None
+    # ставить на треть имеет смысл, только если горизонт и так в средней части кадра
+    return level if level is not None and 0.2 <= level <= 0.8 else None
+
+
+def thirds_crop(W: float, H: float, aspect: float, angle: float, point: tuple[float, float],
+                horizon: float | None = None, sure: bool = True) -> list[float]:
+    """Обрезка пропорции aspect, ставящая point на ближайшее пересечение третей; без объекта — горизонт
+    (доля высоты) на ближайшую треть. Размер рамки 85/75/65% от наибольшей: меньше — только если так
+    объект встаёт на треть заметно точнее (обрезать лишнее не хочется). sure=False (объект угадан по
+    заметности) — не меньше 75%: неуверенная догадка не должна отрезать полкадра."""
+    base = aspect_crop(W, H, aspect, angle)
+    px, py = point
+    yref = horizon if horizon is not None else py
+    best = None
+    for scale in (0.85, 0.75, 0.65) if sure else (0.85, 0.75):
+        cw, ch = (base[2] - base[0]) * scale, (base[3] - base[1]) * scale
+        for tx in (1 / 3, 2 / 3):
+            for ty in (1 / 3, 2 / 3):
+                x0 = float(np.clip(px - tx * cw, 0, 1 - cw))
+                y0 = float(np.clip(yref - ty * ch, 0, 1 - ch))
+                err = abs(px - (x0 + tx * cw)) / cw + abs(yref - (y0 + ty * ch)) / ch + 0.3 * (0.85 - scale)
+                if best is None or err < best[0] - 1e-9:
+                    best = (err, [x0, y0, x0 + cw, y0 + ch])
+    return fit_crop(W, H, best[1], angle)
+
+
 def process_view_region(full: np.ndarray, view_rect: tuple, scale: float, p: dict,
                         style: dict | None = None, src_stats: dict | None = None,
                         look: dict | None = None, prep=None) -> tuple:

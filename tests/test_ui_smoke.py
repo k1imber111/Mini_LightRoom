@@ -300,6 +300,14 @@ if __name__ == "__main__":
         win.carousel.hide()
         wait(app, lambda: not win.rendering and not win.dirty)
 
+        # ИИ-композиция на готовых масках (люди в центре — голова встаёт на пересечение третей)
+        win.ai_thirds()
+        assert win.params["crop"] is not None, "кадр по третям не обрезал"
+        win.ai_horizon()  # на шуме горизонта нет — поворот не меняется
+        assert win.params.get("angle", 0) == 0
+        win.reset_crop()
+        wait(app, lambda: not win.rendering and not win.dirty)
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))
