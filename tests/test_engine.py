@@ -317,6 +317,25 @@ sm = E.saliency_mask(np.clip(scene, 0, 1))
 ys, xs = np.nonzero(sm > 0.5)
 assert sm.shape == (400, 600) and 360 < xs.mean() < 500 and 100 < ys.mean() < 240, (xs.mean(), ys.mean())
 
+# Единый цвет серии: кадр темнее на 1 EV и с тёплым сдвигом подгоняется под эталон.
+gray = np.linspace(0.1, 0.8, 600, dtype=np.float32)[None, :, None] * np.ones((400, 1, 3), np.float32)
+gray = np.clip(gray + rng.normal(0, 0.01, gray.shape).astype(np.float32), 0, 1)
+gray[50:150, 50:200] = (0.2, 0.5, 0.2)   # зелень
+gray[250:350, 350:550] = (0.3, 0.45, 0.7)  # небо
+ref_p = {**E.default_params(), "contrast": 20, "vibrance": 20}
+ref_st = E.match_stats(E.process(gray, ref_p, local=False))
+lin = gray ** 2.2 * 0.5 * np.array([1.12, 1.0, 0.88], np.float32)  # −1 EV и тёплый каст в линейном свете
+shot = np.clip(lin, 0, 1) ** (1 / 2.2)
+t = time.perf_counter()
+mp = E.match_params(shot, ref_p, ref_st, {"crop": [0.1, 0.1, 0.9, 0.9]})
+got = E.match_stats(E.process(shot, mp, local=False))
+before = E.match_stats(E.process(shot, ref_p, local=False))
+print(f"серия: EV {before['ev'] - ref_st['ev']:+.2f} → {got['ev'] - ref_st['ev']:+.2f}, "
+      f"b* {before['b'] - ref_st['b']:+.1f} → {got['b'] - ref_st['b']:+.1f}, {(time.perf_counter() - t) * 1000:.0f} мс")
+assert abs(got["ev"] - ref_st["ev"]) < 0.1 and abs(got["b"] - ref_st["b"]) < 1.5 and abs(got["a"] - ref_st["a"]) < 1.5
+assert mp["crop"] == [0.1, 0.1, 0.9, 0.9] and mp["vibrance"] == 20, "своя обрезка и творческие правки эталона"
+assert abs(mp["exposure"]) <= 150 and abs(mp["temperature"]) <= 60
+
 with tempfile.TemporaryDirectory(prefix="мини_") as d:
     cube = Path(d) / "стиль.cube"
     E.export_cube(cube, p, style, E.lab_stats(img))

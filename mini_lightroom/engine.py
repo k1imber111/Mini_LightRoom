@@ -827,6 +827,69 @@ def process_region(full: np.ndarray, rect: tuple, scale: float, p: dict,
     return crop[iy0:iy1, ix0:ix1], out[iy0:iy1, ix0:ix1]
 
 
+# ---------------------------------------------------------------- единый цвет серии
+
+# Что подгоняется под эталон: шаг для числовой производной и предел сдвига от стартового значения.
+MATCH_VARS = {"exposure": (20, 150), "temperature": (10, 60), "tint": (10, 60), "contrast": (10, 25),
+              "saturation": (10, 25)}
+PER_FRAME = ("crop", "angle", "masks", "denoise", "ai_arr")  # своё у каждого кадра — эталон не копирует
+
+
+def match_stats(img: np.ndarray) -> dict:
+    """Что должно совпасть у кадров серии: яркость (медиана, в EV), разброс L*, средняя хрома и
+    средний цвет полутонов (a*, b*). Хрома при усреднении цвета обрезана на 40: яркий объект
+    (красная куртка) не тянет баланс. Нейтрали не подходят — на закатах их почти нет, и их набор
+    скачет от каждого сдвига баланса, подгонка разваливалась."""
+    lab = cv2.cvtColor(np.clip(img, 0, 1).astype(np.float32), cv2.COLOR_RGB2Lab)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    C = np.hypot(a, b)
+    mid = (L > 25) & (L < 85)
+    if mid.mean() < 0.05:  # почти весь кадр в тенях или в светах — цвет по всему кадру
+        mid = np.ones_like(mid)
+    k = np.minimum(1, 40 / np.maximum(C[mid], 1e-6))
+    Y = ((np.median(L) + 16) / 116) ** 3
+    return {"ev": float(np.log2(max(Y, 1e-4))), "Lstd": float(L.std()), "C": float(C.mean()),
+            "a": float((a[mid] * k).mean()), "b": float((b[mid] * k).mean())}
+
+
+def match_params(img: np.ndarray, ref_params: dict, ref_stats: dict, own: dict | None = None,
+                 style: dict | None = None, look: dict | None = None, ref_auto: dict | None = None) -> dict:
+    """Правки кадра, при которых он выглядит как эталон серии: творческие настройки эталона
+    (стиль, пресет, HSL, кривая, ИИ-цвет без масок) + подгонка экспозиции, баланса, контраста и
+    насыщенности по match_stats. Кадр другой сцены не уезжает: сдвиги ограничены MATCH_VARS.
+    ref_auto — auto_params эталона: старт от разницы авто-тона кадра и эталона (ближе к ответу)."""
+    own = own or {}
+    p = {k: v for k, v in ref_params.items() if k not in PER_FRAME}
+    p.update({k: own[k] for k in PER_FRAME if k in own})
+    if p.get("ai_grade"):
+        p["ai_grade"] = {**p["ai_grade"], "masks": []}  # маски объектов — чужого кадра
+    small = resize_max(np.clip(img, 0, 1), 400)
+    limits = {key: (lo, hi) for key, _, lo, hi, _ in SLIDERS}
+    if ref_auto is not None:
+        mine = auto_params(img)
+        for k in ("exposure", "temperature", "tint"):
+            p[k] = p.get(k, 0) + round(mine[k] - ref_auto[k])
+    # Каждый рычаг правит «свою» меру: так подгонка устойчива (совместное решение уводило оттенок
+    # и насыщенность в пределы, компенсируя одно другим).
+    pairs = {"exposure": "ev", "temperature": "b", "tint": "a", "contrast": "Lstd", "saturation": "C"}
+    base = {k: p.get(k, 0) for k in pairs}
+    ev100 = lambda st, k: st[k] * (100 if k == "ev" else 1)
+    for _ in range(5):
+        cur = match_stats(process(small, p, style, local=False, look=look))
+        for k, stat in pairs.items():
+            d = MATCH_VARS[k][0]
+            m = match_stats(process(small, {**p, k: p.get(k, 0) + d}, style, local=False, look=look))
+            slope = (ev100(m, stat) - ev100(cur, stat)) / d
+            if abs(slope) * MATCH_VARS[k][1] < 2:  # даже весь допустимый сдвиг почти ничего не даёт —
+                continue                             # это другая сцена, рычаг не дёргаем в предел зря
+            damp = 0.4 if k in ("contrast", "saturation") else 0.8  # разброс и хрома больше зависят от сюжета
+            step = damp * (ev100(ref_stats, stat) - ev100(cur, stat)) / slope
+            lim = MATCH_VARS[k][1]
+            v = np.clip(p.get(k, 0) + step, base[k] - lim, base[k] + lim)
+            p[k] = round(float(np.clip(v, *limits[k])))
+    return p
+
+
 # ---------------------------------------------------------------- авто
 
 def auto_params(img: np.ndarray) -> dict:

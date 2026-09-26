@@ -343,6 +343,22 @@ if __name__ == "__main__":
         assert json.dumps(win.params, sort_keys=True, default=str) == before, "ИИ-улучшить не отменилось одним шагом"
         wait(app, lambda: not win.rendering and not win.dirty)
 
+        # единый цвет серии: выделенные кадры получают творческие правки эталона и свою подгонку
+        win.rows["vibrance"].slider.setValue(35)
+        others = [win.strip.item(i) for i in range(win.strip.count()) if win.strip.item(i) is not win.strip.currentItem()]
+        for it in others[:2]:
+            it.setSelected(True)
+        win.match_series()
+        wait(app, lambda: win.a_match.isEnabled(), 60)
+        for it in others[:2]:
+            mp = win.sidecar[Path(it.data(ui.PATH_ROLE)).name]
+            assert mp["vibrance"] == 35, "творческие правки эталона не перенеслись"
+            assert len(win.history[Path(it.data(ui.PATH_ROLE)).name]["undo"]) >= 2, "подгонка не шаг истории"
+        for it in others[:2]:
+            it.setSelected(False)
+        win.rows["vibrance"].slider.setValue(0)
+        wait(app, lambda: not win.rendering and not win.dirty)
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))

@@ -293,6 +293,17 @@ def enhance_job(scene_defs, path, base, params, auto, maps, scene, thumb):
     return path, new, scene, auto, next((v for v in vs if v["id"] == "natural"), None), angle
 
 
+def match_job(ref_params, ref_img, style, look, targets):
+    """Единый цвет серии: эталон — готовый кадр; каждой цели — правки, чтобы выглядела так же."""
+    ref_stats = E.match_stats(E.process(E.resize_max(ref_img, 400), ref_params, style, local=False, look=look))
+    ref_auto = E.auto_params(ref_img)
+    out = {}
+    for path, own in targets:
+        img = E.load_image(path, half=True, max_side=800)
+        out[Path(path).name] = E.match_params(img, ref_params, ref_stats, own, style, look, ref_auto)
+    return out
+
+
 def horizon_job(path, base, sky):
     return path, E.auto_horizon(_seg_input(base), sky)
 
@@ -824,7 +835,11 @@ class MainWindow(QMainWindow):
         self.a_compare.setCheckable(True)
         self.a_copy = self._action("Копировать правки", self.copy_settings, "Ctrl+C")
         self.a_paste = self._action("Вставить в выделенные", self.paste_settings, "Ctrl+V")
-        for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste):
+        self.a_match = self._action("🎞 Единый цвет", self.match_series, "Ctrl+Shift+M",
+                                    "Выделенные кадры (или всю папку) подогнать под этот: тот же стиль и пресет,\n"
+                                    "а экспозиция, баланс белого, контраст и насыщенность — под каждый кадр,\n"
+                                    "чтобы серия выглядела одинаково")
+        for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_match):
             tb.addAction(a)
         tb.addSeparator()
         self.auto_on_open = QCheckBox("Авто для новых кадров")
@@ -1235,7 +1250,7 @@ class MainWindow(QMainWindow):
         self.panel.setEnabled(on)
         for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_export,
                   self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100, self.a_scenes,
-                  self.a_undo, self.a_redo, self.a_crop, self.a_grade):
+                  self.a_undo, self.a_redo, self.a_crop, self.a_grade, self.a_enhance, self.a_match):
             a.setEnabled(on)
         self.zoom_combo.setEnabled(on)
 
@@ -2450,6 +2465,52 @@ class MainWindow(QMainWindow):
     def copy_settings(self):
         self.clipboard = copy.deepcopy(self.params)
         self.toast("Правки скопированы. Выделите кадры (Ctrl/Shift+щелчок) и нажмите Ctrl+V")
+
+    def match_series(self):
+        if self.base is None:
+            return
+        names = [Path(it.data(PATH_ROLE)).name for it in self.strip.selectedItems()]
+        names = [n for n in names if n != self.current.name]
+        if not names:
+            others = [p.name for p in self.files if p.name != self.current.name]
+            if not others:
+                return
+            box = QMessageBox(self)
+            box.setWindowTitle("Единый цвет серии")
+            box.setText(f"Кадры не выделены. Подогнать под этот кадр все остальные кадры папки ({len(others)})?\n"
+                        "Их правки цвета заменятся, обрезка и маски останутся. Ctrl+Z на каждом кадре вернёт.")
+            yes = box.addButton("✅ Подогнать все", QMessageBox.AcceptRole)
+            box.addButton("❌ Отмена", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is not yes:
+                return
+            names = others
+        self.commit_history()
+        self.store_current()
+        ref = dict(self.params)
+        targets = [(str(self.folder / n), E.normalize_params(self.sidecar.get(n))) for n in names]
+        self.a_match.setEnabled(False)
+        self.toast(f"Подгоняю цвет {len(names)} кадров под «{self.current.name}»…", 0)
+        run_task(match_job, ref, self.base, self.current_style(), self.current_look(), targets,
+                 done=self.on_matched,
+                 fail=lambda m: (self.a_match.setEnabled(True), self.toast(f"Не получилось: {m}", 10000)))
+
+    def on_matched(self, res: dict):
+        self.a_match.setEnabled(True)
+        for name, p in res.items():
+            h = self.history.setdefault(
+                name, {"undo": [copy.deepcopy(E.normalize_params(self.sidecar.get(name)))], "redo": []})
+            self.sidecar[name] = p
+            h["undo"].append(copy.deepcopy(p))
+            h["redo"].clear()
+            if self.current and name == self.current.name:
+                self.params = copy.deepcopy(p)
+                self.sync_controls()
+                self.request_render()
+        self.history_dirty |= bool(res)
+        self.save_sidecar()
+        self.refresh_look_icons()
+        self.toast(f"Единый цвет: подогнано кадров — {len(res)}. На каждом кадре Ctrl+Z вернёт прежний цвет", 8000)
 
     def paste_settings(self):
         if not self.clipboard:
