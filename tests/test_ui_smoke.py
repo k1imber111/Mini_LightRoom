@@ -214,6 +214,33 @@ if __name__ == "__main__":
         assert win.params["crop"] is None and (win.view.src_w, win.view.src_h) == (900, 600)
         wait(app, lambda: not win.rendering and not win.dirty)
 
+        # тональная кривая: точка мышью, перетаскивание, удаление, каналы, готовые формы; HSL; отмена
+        cv = win.curve
+        cv.resize(260, 220)
+        p_mid = cv._to_w(128, 128).toPoint()
+        QTest.mousePress(cv, Qt.LeftButton, Qt.NoModifier, p_mid)
+        QTest.mouseMove(cv, cv._to_w(128, 175).toPoint())
+        QTest.mouseRelease(cv, Qt.LeftButton, Qt.NoModifier, cv._to_w(128, 175).toPoint())
+        pts = win.params["curve"]["rgb"]
+        assert len(pts) == 3 and pts[1][1] > 160, pts
+        QTest.mouseDClick(cv, Qt.LeftButton, Qt.NoModifier, cv._to_w(*pts[1]).toPoint())
+        assert "rgb" not in win.params["curve"], "двойной щелчок не удалил точку"
+        win.curve_btns["b"].click()
+        win.curve_shape.setCurrentIndex(list(ui.CURVE_SHAPES).index("Матовая (плёнка)") + 1)
+        win.on_curve_shape(win.curve_shape.currentIndex())
+        assert win.params["curve"]["b"][0][1] == 28 and "rgb" not in win.params["curve"]
+        win.curve_btns["rgb"].click()
+        win.hsl_rows[("green", 1)].slider.setValue(-60)
+        win.hsl_rows[("orange", 2)].slider.setValue(25)
+        assert win.params["hsl"] == {"green": [0, -60, 0], "orange": [0, 0, 25]}
+        wait(app, lambda: not win.rendering and not win.dirty)
+        win.commit_history()
+        win.reset_hsl()
+        win.commit_history()
+        win.undo()
+        assert win.params["hsl"]["green"][1] == -60 and win.hsl_rows[("green", 1)].slider.value() == -60
+        wait(app, lambda: not win.rendering and not win.dirty)
+
         # пресет-образ: выбор в списке, миниатюры кадра на пунктах, сила
         assert len(win.looks) >= 20
         name = next(iter(win.looks))

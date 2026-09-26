@@ -47,7 +47,8 @@ def default_params() -> dict:
     # style2/style_mix — второй стиль и его доля в смеси.
     p.update(style="", style_strength=70, style_tone=70, style_skin=60, style_mode=0, style2="", style_mix=50,
              look="", look_strength=100, masks=[],
-             crop=None, angle=0.0)  # обрезка [x0, y0, x1, y1] в долях повёрнутого кадра, поворот в градусах
+             crop=None, angle=0.0,  # обрезка [x0, y0, x1, y1] в долях повёрнутого кадра, поворот в градусах
+             hsl={}, curve={})  # HSL: {цвет: [оттенок, насыщ., яркость]}; кривая: {"rgb"|"r"|"g"|"b": точки 0..255}
     return p
 
 
@@ -412,6 +413,19 @@ def process(img: np.ndarray, p: dict, style: dict | None = None,
         chroma = img.max(-1, keepdims=True) - img.min(-1, keepdims=True)
         k = (1 + sat) * (1 + vib * (1 - np.clip(chroma * 1.5, 0, 1)))
         img = gray + (img - gray) * k
+
+    # Тональная кривая, затем HSL — как в Lightroom; обе поточечные, поэтому входят и в LUT.
+    curves = {ch: pts for ch, pts in (p.get("curve") or {}).items() if pts}
+    if curves:
+        img = np.clip(img, 0, 1)
+        if "rgb" in curves:
+            img = _apply_curve(img, curves["rgb"])
+        for i, ch in enumerate("rgb"):
+            if ch in curves:
+                img[..., i] = _apply_curve(img[..., i], curves[ch])
+    hsl = {c: v for c, v in (p.get("hsl") or {}).items() if any(v)}
+    if hsl:
+        img = _apply_hsl(np.clip(img, 0, 1).astype(np.float32), hsl)
 
     if style:
         img = _apply_style(np.clip(img, 0, 1), style, p, src_stats)

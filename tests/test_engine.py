@@ -108,6 +108,22 @@ t = time.perf_counter()
 E.process(img, pm)
 print(f"обработка с 4 масками: {(time.perf_counter() - t) * 1000:.0f} мс")
 
+# Тональная кривая и HSL: поточечные, после базовых ползунков, входят в LUT.
+mid = np.full((20, 20, 3), 0.5, np.float32)
+assert E.process(mid, {**E.default_params(), "curve": {"rgb": [[0, 0], [128, 170], [255, 255]]}}).mean() > 0.6
+only_b = E.process(mid, {**E.default_params(), "curve": {"b": [[0, 0], [128, 60], [255, 255]]}})
+assert abs(only_b[..., 0].mean() - 0.5) < 0.01 and only_b[..., 2].mean() < 0.3, "кривая B задела другие каналы"
+patch = np.zeros((10, 20, 3), np.float32)
+patch[:, :10] = [0.2, 0.7, 0.2]    # зелёный
+patch[:, 10:] = [0.8, 0.15, 0.15]  # красный
+hs = E.process(patch, {**E.default_params(), "hsl": {"green": [0, -100, 0]}})
+assert np.ptp(hs[5, 3]) < 0.02 and np.abs(hs[:, 10:] - patch[:, 10:]).max() < 0.01, "HSL задел не тот цвет"
+assert np.abs(E.process(img, {**E.default_params(), "hsl": {"red": [0, 0, 0]}, "curve": {}}) - img).max() < 1e-3
+with tempfile.TemporaryDirectory() as d:
+    E.export_cube(Path(d) / "a.cube", E.default_params(), None, None)
+    E.export_cube(Path(d) / "b.cube", {**E.default_params(), "curve": {"rgb": [[0, 30], [255, 255]]}}, None, None)
+    assert (Path(d) / "a.cube").read_text() != (Path(d) / "b.cube").read_text(), "кривая не попала в LUT"
+
 # Обрезка и горизонт: последний шаг, одна матрица для превью, масштаба и экспорта.
 W0, H0 = 1500, 1000
 c169 = E.aspect_crop(W0, H0, 16 / 9)

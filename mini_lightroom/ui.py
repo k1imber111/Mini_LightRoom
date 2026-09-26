@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -72,6 +73,7 @@ from . import masks as MK
 from . import scene as S
 from . import segment as G
 from .crop_editor import CropEditor
+from .curve_editor import CURVE_SHAPES, CurveEditor
 from .mask_editor import MaskEditor
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -85,6 +87,10 @@ SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат 
 MASKS_DIR = ".mini_lightroom_masks"  # ИИ-маски кадров (PNG) рядом со снимками
 PREVIEW_SIDE = 1400
 PATH_ROLE = Qt.UserRole
+# Цвета HSL: ключ движка, подпись, цвет метки.
+HSL_COLORS = [("red", "Красный", "#ff4d4d"), ("orange", "Оранжевый", "#ff9a3d"), ("yellow", "Жёлтый", "#f2d33b"),
+              ("green", "Зелёный", "#4fd463"), ("aqua", "Голубой", "#3dd6d0"), ("blue", "Синий", "#4d7dff"),
+              ("purple", "Фиолетовый", "#9b5cff"), ("magenta", "Пурпурный", "#ff4fd0")]
 # Пропорции обрезки: подпись → ширина/высота; "cam" — как снимала камера, "orig" — как у RAW.
 ASPECTS = [("Свободно", None), ("Как в камере", "cam"), ("Исходное", "orig"), ("1:1", 1.0), ("4:5", 0.8),
            ("3:2", 1.5), ("4:3", 4 / 3), ("16:9", 16 / 9)]
@@ -824,6 +830,61 @@ class MainWindow(QMainWindow):
             else "Нужны библиотеки ИИ: запустите install_ai.bat")
         self.rows["denoise"].setEnabled(N.available())
 
+        # Тональная кривая
+        box = QGroupBox("Тональная кривая")
+        cvl = QVBoxLayout(box)
+        row = QHBoxLayout()
+        self.curve_btns: dict[str, QPushButton] = {}
+        for ch, label in (("rgb", "RGB"), ("r", "R"), ("g", "G"), ("b", "B")):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setFixedWidth(42)
+            b.setToolTip("Общая кривая" if ch == "rgb" else f"Кривая канала {label}: оттенок светов и теней")
+            b.clicked.connect(lambda _=False, c=ch: self.curve.set_channel(c))
+            row.addWidget(b)
+            self.curve_btns[ch] = b
+        self.curve_btns["rgb"].setChecked(True)
+        self.curve_shape = QComboBox()
+        self.curve_shape.addItem("Форма…")
+        self.curve_shape.addItems(list(CURVE_SHAPES))
+        self.curve_shape.setToolTip("Готовая форма для выбранного канала")
+        self.curve_shape.activated.connect(self.on_curve_shape)
+        row.addWidget(self.curve_shape, 1)
+        cvl.addLayout(row)
+        self.curve = CurveEditor()
+        self.curve.changed.connect(self.on_curve)
+        cvl.addWidget(self.curve)
+        b = QPushButton("Сброс кривой")
+        b.setToolTip("Все каналы — прямая линия")
+        b.clicked.connect(self.reset_curve)
+        cvl.addWidget(b)
+        pl.addWidget(box)
+
+        # HSL: оттенок, насыщенность, яркость по 8 цветам
+        box = QGroupBox("HSL / Цвет")
+        hl = QVBoxLayout(box)
+        tabs = QTabWidget()
+        self.hsl_rows: dict[tuple[str, int], SliderRow] = {}
+        tips = ("Сдвиг оттенка цвета: например, зелень в сторону мяты или жёлтого",
+                "Насыщенность только этого цвета", "Яркость только этого цвета: светлее кожа, темнее небо")
+        for idx, tab_name in enumerate(("Оттенок", "Насыщенность", "Яркость")):
+            w = QWidget()
+            tl = QVBoxLayout(w)
+            tl.setContentsMargins(4, 4, 4, 4)
+            for color, label, hexc in HSL_COLORS:
+                r = SliderRow(f"hsl_{color}_{idx}", f'<span style="color:{hexc}">●</span> {label}', -100, 100)
+                r.setToolTip(tips[idx])
+                r.changed.connect(lambda _k, v, c=color, i=idx: self.on_hsl(c, i, v))
+                tl.addWidget(r)
+                self.hsl_rows[(color, idx)] = r
+            tabs.addTab(w, tab_name)
+        hl.addWidget(tabs)
+        b = QPushButton("Сброс HSL")
+        b.clicked.connect(self.reset_hsl)
+        hl.addWidget(b)
+        pl.addWidget(box)
+
         # Маски: локальные правки
         box = QGroupBox("Маски")
         ml = QVBoxLayout(box)
@@ -1147,6 +1208,10 @@ class MainWindow(QMainWindow):
         for key, row in self.rows.items():
             row.set_value(self.params.get(key, 0))
         self.angle_row.set_value(round(self.params.get("angle", 0) * 10))
+        self.curve.set_curves(self.params.get("curve"))
+        hsl = self.params.get("hsl") or {}
+        for (color, idx), r in self.hsl_rows.items():
+            r.set_value(hsl.get(color, [0, 0, 0])[idx])
         self.refresh_mask_list()
         self.update_geometry()
         for combo, key in ((self.style_combo, "style"), (self.style2_combo, "style2")):
@@ -1201,6 +1266,8 @@ class MainWindow(QMainWindow):
         self.rendering = False
         self.after = to_qimage(out)
         self.hist.set_hist(hist)
+        self.curve.hist = hist
+        self.curve.update()
         self.show_current()
         self.detail_timer.start()
         if self.dirty:
@@ -1299,6 +1366,43 @@ class MainWindow(QMainWindow):
         self.sync_controls()
         self.request_render()
         self.toast(msg)
+
+    # ---------- тональная кривая и HSL
+    # Словари заменяются новыми, а не меняются на месте: фоновая обработка держит свою копию params.
+
+    def on_curve(self, ch: str, pts):
+        curves = {k: v for k, v in (self.params.get("curve") or {}).items() if k != ch}
+        if pts:
+            curves[ch] = pts
+        self.params["curve"] = curves
+        self.request_render()
+
+    def on_curve_shape(self, idx: int):
+        if idx > 0:
+            self.curve.set_points(CURVE_SHAPES[self.curve_shape.currentText()])
+            self.curve_shape.setCurrentIndex(0)
+
+    def reset_curve(self):
+        self.params["curve"] = {}
+        self.curve.set_curves({})
+        self.request_render()
+
+    def on_hsl(self, color: str, idx: int, value: int):
+        hsl = {c: list(v) for c, v in (self.params.get("hsl") or {}).items()}
+        vals = hsl.get(color, [0, 0, 0])
+        vals[idx] = value
+        if any(vals):
+            hsl[color] = vals
+        else:
+            hsl.pop(color, None)
+        self.params["hsl"] = hsl
+        self.request_render()
+
+    def reset_hsl(self):
+        self.params["hsl"] = {}
+        for r in self.hsl_rows.values():
+            r.set_value(0)
+        self.request_render()
 
     # ---------- история: отмена и повтор
 
