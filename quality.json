@@ -1,0 +1,18 @@
+{
+  "_comment": "Пороги оценки брака (mini_lightroom/quality.py). σ — ширина размытия края в пикселях кадра 6000 px по длинной стороне: резкий кадр ≈ 0.4–1.0. Подобраны на 44 ARW Sony и искусственном браке (PROJECT_STATE, раздел 9); первая версия консервативна.",
+  "version": 2,
+  "soft_doubt": 1.15,
+  "soft_bad": 1.7,
+  "motion_aniso": 1.6,
+  "motion_doubt": 1.4,
+  "motion_bad": 2.0,
+  "miss_ratio": 1.7,
+  "miss_best": 0.9,
+  "min_struct": 800,
+  "coarse_min": 6.0,
+  "cell": 64,
+  "block": 4,
+  "norm_long_side": 6000,
+  "af_box": 0.07,
+  "strip_cells": 8
+}
