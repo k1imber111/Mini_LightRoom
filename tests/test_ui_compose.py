@@ -97,5 +97,46 @@ if __name__ == "__main__":
         win.crop_carousel.setCurrentRow(1)
         win.cancel_crop()
         assert win.params["crop"] is None and not win.crop_mode and not win.crop_carousel.isVisible()
+        # рамка во весь кадр не «заблокирована»: тянем новую; вне рамки — тоже; пропорции держатся; сетка включает обрезку
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        win.cropper.aspect = None
+        win.overlay_combo.setCurrentIndex(1)
+        win.on_overlay_pick(1)  # золотая сетка: режим обрезки включается сам
+        assert win.crop_mode and win.cropper.overlay == "phi"
+        win.cropper.rect = [0.0, 0.0, 1.0, 1.0]
+        v = win.view
+
+        def drag(a, b):
+            p0, p1 = win.cropper._px(v, *a).toPoint(), win.cropper._px(v, *b).toPoint()
+            QTest.mousePress(v, Qt.LeftButton, Qt.NoModifier, p0)
+            for k in range(1, 6):
+                QTest.mouseMove(v, p0 + (p1 - p0) * k / 5)
+            QTest.mouseRelease(v, Qt.LeftButton, Qt.NoModifier, p1)
+
+        drag((0.2, 0.2), (0.7, 0.6))
+        r = win.cropper.rect
+        assert abs(r[0] - 0.2) < 0.01 and abs(r[1] - 0.2) < 0.01 and abs(r[2] - 0.7) < 0.02 and abs(r[3] - 0.6) < 0.02, r
+        before = list(r)
+        drag((0.45, 0.4), (0.55, 0.45))  # теперь рамка меньше кадра — двигается, а не рисуется заново
+        assert win.cropper.rect[2] - win.cropper.rect[0] > 0.45 and win.cropper.rect != before
+        win.cropper.aspect = 1.0
+        drag((0.9, 0.9), (0.4, 0.5))  # вне рамки, снизу справа налево вверх; квадрат по большему движению
+        r = win.cropper.rect
+        assert abs((r[2] - r[0]) * 1500 - (r[3] - r[1]) * 1000) < 6, r
+        assert E.crop_valid(1500, 1000, r, 0)
+        win.cancel_crop()
+
+        # ползунок: при протяжке показывается быстрый кадр (уменьшенный), через SETTLE_MS — полный
+        win.rows["exposure"].slider.setValue(win.rows["exposure"].slider.value() + 30)
+        wait(app, lambda: win.after.width() <= ui.FAST_SIDE + 1, 10)
+        assert win.settle_timer.isActive() or win.after.width() <= ui.FAST_SIDE + 1
+        wait(app, lambda: win.after.width() > ui.FAST_SIDE * 1.5, 10)
+        assert win.after.width() >= 1300 and not win.dirty
+        # быстрый проход не теряет последнее значение: серия правок → итог соответствует последнему
+        for v in (10, 20, 30, 40, 50):
+            win.rows["contrast"].slider.setValue(v)
+        wait(app, lambda: not win.rendering and not win.dirty and not win.settle_timer.isActive() and win.after.width() > 1300, 10)
+        assert win.params["contrast"] == 50
         win.close()
     print("авто-кадр в окне OK")

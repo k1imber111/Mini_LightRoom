@@ -90,8 +90,12 @@ class CropEditor(QObject):
                 return True
         x, y = self._norm(view, pos)
         x0, y0, x1, y1 = self.rect
-        if x0 < x < x1 and y0 < y < y1:
+        full = x1 - x0 > 0.999 and y1 - y0 > 0.999  # рамка во весь кадр: двигать нечего — тянем новую
+        if x0 < x < x1 and y0 < y < y1 and not full:
             self._drag = ("move", (x, y), list(self.rect))
+            return True
+        if 0 <= x <= 1 and 0 <= y <= 1:  # вне рамки (или рамка во весь кадр): новая рамка от этой точки
+            self._drag = ("new", (x, y), list(self.rect))
             return True
         return False
 
@@ -101,6 +105,11 @@ class CropEditor(QObject):
         what, (sx, sy), r0 = self._drag
         x, y = self._norm(view, e.position())
         x0, y0, x1, y1 = r0
+        if what == "new":
+            self._new_rect(sx, sy, x, y)
+            self.changed.emit()
+            view.update()
+            return True
         if what == "move":
             dx, dy = x - sx, y - sy
             dx = min(max(dx, -x0), 1 - x1)
@@ -130,6 +139,31 @@ class CropEditor(QObject):
         self.changed.emit()
         view.update()
         return True
+
+    def _new_rect(self, ax: float, ay: float, x: float, y: float) -> None:
+        """Рамка от точки нажатия (ax, ay) до курсора; при заданных пропорциях — по большему из движений."""
+        x, y = min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+        w, h = abs(x - ax), abs(y - ay)
+        if w < 0.02 and h < 0.02:
+            return  # ещё не потянули: прежняя рамка остаётся
+        if self.aspect:
+            k = self.aspect * self.size[1] / self.size[0]  # ширина = высота · k (в долях холста)
+            if w / k > h:
+                h = w / k
+            else:
+                w = h * k
+        sx, sy = (1 if x >= ax else -1), (1 if y >= ay else -1)
+        rect = [min(ax, ax + sx * w), min(ay, ay + sy * h), max(ax, ax + sx * w), max(ay, ay + sy * h)]
+        rect = [max(0.0, rect[0]), max(0.0, rect[1]), min(1.0, rect[2]), min(1.0, rect[3])]
+        if self.aspect and (rect[2] - rect[0]) / k != rect[3] - rect[1]:  # упёрлись в край — сжимаем вторую сторону
+            w2, h2 = rect[2] - rect[0], rect[3] - rect[1]
+            if w2 / k > h2:
+                w2 = h2 * k
+            else:
+                h2 = w2 / k
+            rect = [ax if sx > 0 else ax - w2, ay if sy > 0 else ay - h2, 0.0, 0.0]
+            rect[2], rect[3] = rect[0] + w2, rect[1] + h2
+        self._try(rect)
 
     def _keep_aspect(self, what, r0, r):
         W, H = self.size
