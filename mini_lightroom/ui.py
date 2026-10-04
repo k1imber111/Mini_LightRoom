@@ -1531,7 +1531,7 @@ class MainWindow(QMainWindow):
         if level in ("bad", "doubt") or self.flags.get(name):
             defects = (self.quality.get(name) or {}).get("defects") or []
             why = f" · {SHORT.get(defects[0]['type'], '')}" if defects and not self.flags.get(name) else ""
-            lines.append(title + why)
+            lines.append({"Сомнительно": "Сомнит."}.get(title, title) + why)  # короче: лента узкая
         sc = self.scene_by_id.get(self.scene_of.get(name, [None])[0])
         if sc:
             lines.append(f"{sc.get('icon', '')} {sc['name']}")
