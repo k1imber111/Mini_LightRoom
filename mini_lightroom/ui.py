@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QByteArray,
     QFile,
     QObject,
+    QPoint,
     QPointF,
     QRectF,
     QRunnable,
@@ -246,41 +247,22 @@ def tiles_job(path, boxes):
     return path, Q.crop_tiles(Q.load_rgb(path)[0], boxes)
 
 
-def compose_job(path, base, models_dir, scene_id, W, H, angle, aspect):
-    """Авто-кадр: главное на кадре (лицо → человек → заметное пятно), горизонт, жанр → варианты кадрирования
-    с миниатюрами. Только из AI_POOL (сегментация, mediapipe)."""
+def analyze_job(path, base, models_dir, scene_id):
+    """Что главное на кадре: лицо → человек → предмет (птица, корабль…) → яркое пятно (луна, солнце); горизонт, жанр
+    и карта важности — всё в долях полного кадра, один раз на кадр. Только из AI_POOL (сегментация, mediapipe)."""
     img = _seg_input(base)
     finder = FC.get_finder(models_dir) if FC.available() else None
     faces = finder.detect(E.load_thumb(path, 1600)) if finder else []
-    maps = G.get_segmenter(models_dir).masks(img, ["people", "sky"]) if G.available() else {}
-    people = E.main_people(maps["people"]) if "people" in maps else None
-    salient = None
-    if not faces and people is None:
-        salient = G.refine(E.saliency_mask(img), img)
-        if salient.mean() < 0.02:  # заметное пятно меньше 2% кадра — не объект съёмки
-            salient = None
-    subject = C.subject_from(faces, people, salient)
-    horizon = E.horizon_level(maps.get("sky"))
-    A, _ = E.crop_matrix(W, H, None, angle)  # точки полного кадра → повёрнутый холст, где живёт рамка
-
-    def tp(x, y):
-        rx, ry = A @ (x * W, y * H, 1.0)
-        return float(rx / W), float(ry / H)
-
-    if subject:
-        subject["point"] = tp(*subject["point"])
-        xs, ys = zip(*(tp(x, y) for x in (subject["box"][0], subject["box"][2]) for y in (subject["box"][1], subject["box"][3])),
-                     strict=True)
-        subject["box"] = (min(xs), min(ys), max(xs), max(ys))
-    if horizon is not None:
-        horizon = tp(0.5, horizon)[1]
-    weight = salient if salient is not None else people
-    genre = C.genre_of(scene_id, bool(faces))
-    variants = C.suggest(W, H, angle, subject, horizon, genre, aspect, weight)
-    small = E.resize_max(base, 260)
-    thumbs = [to_u8(E.apply_crop(small, v["rect"], angle, (W, H))) for v in variants]
-    thumbs.insert(0, to_u8(E.apply_crop(small, None, angle, (W, H))))
-    return path, variants, thumbs, {"genre": genre, "subject": subject["kind"] if subject else None}
+    maps = G.get_segmenter(models_dir).masks(img, ["people", "sky", "objects"]) if G.available() else {}
+    people, objects = maps.get("people"), maps.get("objects")
+    subject = C.subject_from(faces, people, objects, img)
+    parts = [m for m in (people, objects) if m is not None]
+    weight = None
+    if parts:
+        m = np.maximum.reduce(parts)
+        weight = cv2.resize(m, (96, max(8, round(96 * m.shape[0] / m.shape[1]))), interpolation=cv2.INTER_AREA)
+    return path, {"subject": subject, "horizon": E.horizon_level(maps.get("sky")),
+                  "genre": C.genre_of(scene_id, bool(faces)), "weight": weight}
 
 
 def style_job(path, name):
@@ -436,6 +418,7 @@ class ImageView(QWidget):
         self.badge = ""
         self.editor = None  # MaskEditor / CropEditor: забирает левую кнопку
         self.marks: list[tuple] = []  # рамки брака: (рамка в долях кадра, уровень, подпись)
+        self.hint = ""  # подсказка-плашка сверху кадра (например, «укажите главное»)
         # Обрезка: A — полный кадр (пиксели) → показанный кадр; src_w×src_h — размер показанного кадра.
         self.A = np.array([[1.0, 0, 0], [0, 1.0, 0]])
         self.Ainv = self.A.copy()
@@ -638,6 +621,15 @@ class ImageView(QWidget):
         if self.message:
             p.setPen(QColor("#9a9a9a"))
             p.drawText(self.rect(), Qt.AlignCenter, self.message)
+        if self.hint:
+            p.setRenderHint(QPainter.Antialiasing)
+            r = p.fontMetrics().boundingRect(self.hint).adjusted(-16, -8, 16, 8)
+            r.moveCenter(QPoint(self.width() // 2, 28))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#6c9bf2"))
+            p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+            p.setPen(QColor("#101010"))
+            p.drawText(r, Qt.AlignCenter, self.hint)
 
 
 class Histogram(QWidget):
@@ -845,6 +837,13 @@ class MainWindow(QMainWindow):
         self.tile_cache: dict[tuple, list] = {}
         self.compose_busy = False
         self.compose_variants: list[dict] = []
+        self.analysis: dict[str, dict] = {}        # что главное на кадре (по имени), в долях полного кадра
+        self.manual_subject: dict[str, tuple] = {}  # точка, которую указали вы: заменяет найденный объект
+        self.analysis_busy = False
+        self._analysis_then: list = []
+        self.pick_mode = False
+        self._reenter_crop = False  # листаем кадры, оставаясь в авто-кадрировании
+        self._silent_overlay = False
         self.current: Path | None = None
         self.base: np.ndarray | None = None
         self.before: QImage | None = None
@@ -1025,6 +1024,10 @@ class MainWindow(QMainWindow):
         self.a_mask_show = self._action("Показать маску", lambda: self.mask_show.toggle(), "O")
         self.a_overlay = self._action("Вид сетки", self.cycle_overlay, "O", "Сетка-подсказка: трети, золотое сечение, спираль…")
         self.a_overlay_rot = self._action("Повернуть сетку", self.rotate_overlay, "Shift+O")
+        self.a_tool_prev = self._action("Предыдущее правило", lambda: self.cropper.cycle_overlay(-1), "Left")
+        self.a_tool_next = self._action("Следующее правило", lambda: self.cropper.cycle_overlay(1), "Right")
+        self.a_tool_prev.setEnabled(False)
+        self.a_tool_next.setEnabled(False)
         self.a_overlay.setEnabled(False)
         self.a_overlay_rot.setEnabled(False)
         self.cropper.overlay = self.settings.get("overlay", "thirds") if self.settings.get("overlay") in dict(OVERLAYS)             else "thirds"
@@ -1139,6 +1142,24 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self.ai_thirds)
         row.addWidget(b)
         cl.addLayout(row)
+        self.auto_rule = QCheckBox("Авто-кадр по выбранному правилу")
+        self.auto_rule.setChecked(bool(self.settings.get("auto_rule", True)))
+        self.auto_rule.setToolTip("В режиме обрезки выбранная сетка (список «Сетка», клавиша O или стрелки ← →) сама\n"
+                                  "кадрирует кадр на экране по этому правилу — без подтверждений. Листая кадры, вы\n"
+                                  "остаётесь в этом режиме. Выключите, чтобы рамку ставить только руками.")
+        self.auto_rule.toggled.connect(lambda on: self.remember(auto_rule=on))
+        cl.addWidget(self.auto_rule)
+        pick_row = QHBoxLayout()
+        b = QPushButton("Указать главное")
+        b.setIcon(tool_icon("target"))
+        b.setToolTip("Щёлкните по кадру там, вокруг чего строить композицию (если программа не нашла главное сама)")
+        b.clicked.connect(lambda: (self.a_crop.trigger() if not self.crop_mode else None, self.begin_pick()))
+        pick_row.addWidget(b)
+        b = QPushButton("Сброс точки")
+        b.setToolTip("Забыть указанную точку: главное снова ищется само")
+        b.clicked.connect(self.reset_subject)
+        pick_row.addWidget(b)
+        cl.addLayout(pick_row)
         self.compose_btn = QPushButton("Авто-кадр по композиции")
         self.compose_btn.setIcon(tool_icon("sparkles"))
         self.compose_btn.setToolTip("Находит главное (лицо, человек, заметный объект), горизонт и жанр кадра и предлагает\n"
@@ -1557,6 +1578,8 @@ class MainWindow(QMainWindow):
         self.thumb_failed: set[str] = set()
         self.thumb_pix.clear()
         self.tile_cache.clear()
+        self.analysis.clear()
+        self.manual_subject.clear()
         self.quality = dict(self.sidecar.get(QUALITY_KEY, {}))
         self.flags = dict(self.sidecar.get(FLAGS_KEY, {}))
         self.qbar.hide()
@@ -1812,7 +1835,7 @@ class MainWindow(QMainWindow):
             self.strip.takeItem(self.strip.row(it))
         self.files = [f for f in self.files if f != p]
         for d in (self.thumbs, self.thumb_pix, self.sidecar, self.scene_of, self.quality, self.flags, self.history,
-                  self.isos, self.cam_aspects, self.grade_cache):
+                  self.isos, self.cam_aspects, self.grade_cache, self.analysis, self.manual_subject):
             d.pop(name, None)
         self.cache.pop(p, None)
         self.history_dirty = True
@@ -1859,8 +1882,10 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         if self.crop_mode:
+            stay = self.auto_rule.isChecked()  # авто-кадрирование: следующий кадр тоже сразу по правилу
             self.a_crop.setChecked(False)
             self.toggle_crop()
+            self._reenter_crop = stay
         self.commit_history()
         self.store_current()
         self.current = Path(item.data(PATH_ROLE))
@@ -1910,6 +1935,10 @@ class MainWindow(QMainWindow):
         self.request_render()
         self.refresh_look_icons()
         self.ensure_ai_masks()
+        if self._reenter_crop:
+            self._reenter_crop = False
+            self.a_crop.setChecked(True)
+            self.toggle_crop()
         if self.carousel.isVisible():  # карусель открыта — варианты сразу для нового кадра
             self.grade_variants = []
             self.carousel.clear()
@@ -2237,24 +2266,150 @@ class MainWindow(QMainWindow):
 
     # ---------- авто-кадр по композиции
 
+    def request_analysis(self, then):
+        """Анализ главного на кадре — в фоне, один раз на кадр; then() вызывается, когда он готов."""
+        if self.base is None:
+            return
+        name = self.current.name
+        if name in self.analysis:
+            then()
+            return
+        self._analysis_then.append(then)
+        if self.analysis_busy:
+            return
+        self.analysis_busy = True
+        self.toast("Ищу главное на кадре…", 0)
+        sid = (self.scene_of.get(name) or [None])[0]
+        run_task(analyze_job, self.current, self.base, MODELS_DIR, sid, done=self.on_analyzed,
+                 fail=self.on_analysis_fail, pool=AI_POOL)
+
+    def on_analyzed(self, res):
+        path, an = res
+        self.analysis_busy = False
+        if path.name in self.items:
+            self.analysis[path.name] = an
+        cbs, self._analysis_then = self._analysis_then, []
+        for cb in cbs:  # кадр мог смениться: каждый обработчик сам проверит анализ текущего и при нужде запросит заново
+            cb()
+
+    def on_analysis_fail(self, msg):
+        self.analysis_busy = False
+        cbs, self._analysis_then = self._analysis_then, []
+        if self.current is not None:  # без анализа правило ставится по горизонту/точке, но не зацикливаемся
+            self.analysis[self.current.name] = {"subject": None, "horizon": None, "genre": "other", "weight": None,
+                                                "error": msg}
+        self.toast(f"Не удалось найти главное: {msg}. Укажите точку на кадре", 8000)
+        for cb in cbs:
+            cb()
+
+    def _auto_aspect(self) -> float:
+        """Пропорции автокадрирования: заданные в списке, иначе текущей рамки (кадр не меняет формат сам)."""
+        if self.cropper.aspect:
+            return self.cropper.aspect
+        W, H = self.full_wh
+        x0, y0, x1, y1 = self.cropper.rect
+        return (x1 - x0) * W / ((y1 - y0) * H)
+
+    def _crop_is_default(self) -> bool:
+        """Кадр ещё не кадрировали руками: нет обрезки или она — формат камеры, поставленный при открытии."""
+        crop = self.params.get("crop")
+        if not crop:
+            return True
+        cam = self.cam_aspects.get(self.current.name) if self.current else None
+        if not cam:
+            return False
+        W, H = self.full_wh
+        ref = E.aspect_crop(W, H, cam, self.params.get("angle", 0))
+        return all(abs(a - b) < 0.003 for a, b in zip(crop, ref, strict=True))
+
+    def auto_apply_rule(self, flip: int | None = None):
+        """Кадр, который сейчас на экране, — по выбранному правилу композиции: главное находится само, рамка встаёт
+        на силовую точку правила. Нет объекта — просим указать точку (горизонт, если он есть, уже учтён)."""
+        if self.base is None or not self.crop_mode:
+            return
+        name = self.current.name
+        if name not in self.analysis:
+            self.request_analysis(lambda: self.auto_apply_rule(flip))
+            return
+        an = self.analysis[name]
+        manual = self.manual_subject.get(name)
+        rule = self.cropper.overlay
+        W, H = self.full_wh
+        vs = C.plan(an, W, H, self.params.get("angle", 0), self._auto_aspect(), (rule,), manual, flip)
+        found = bool(an.get("subject")) or manual is not None
+        if vs:
+            v = vs[0]
+            self.cropper.rect = list(v["rect"])
+            if rule in ("spiral", "triangle"):
+                self.cropper.flip = v["flip"]
+            self.view.update()
+            self.on_crop_rect()
+            how = (manual and "ваша точка") or (an["subject"]["how"] if an.get("subject") else "горизонт")
+            self.toast(f"{v['label']} ({how}): {v['why']}" + ("" if found else ". Главное не найдено — щёлкните по "
+                                                               "нему на кадре, и я кадрирую вокруг этой точки"), 8000)
+        elif not found:
+            self.toast("Главное на кадре не найдено", 3000)
+        if not found:
+            self.begin_pick()
+
+    def begin_pick(self):
+        """Следующий щелчок по кадру — точка, вокруг которой строится композиция."""
+        if not self.crop_mode:
+            return
+        self.pick_mode = True
+        self.cropper.pick_cb = self.on_subject_pick
+        self.view.hint = "Щёлкните по главному на кадре · Esc — отмена"
+        self.view.update()
+
+    def end_pick(self):
+        self.pick_mode = False
+        self.cropper.pick_cb = None
+        self.view.hint = ""
+        self.view.update()
+
+    def on_subject_pick(self, pos):
+        nx, ny = self.view.to_norm(pos)
+        self.end_pick()
+        if self.current is None:
+            return
+        self.manual_subject[self.current.name] = (min(max(nx, 0.0), 1.0), min(max(ny, 0.0), 1.0))
+        self.auto_apply_rule()
+
+    def reset_subject(self):
+        """Забыть указанную вручную точку: главное снова ищется само."""
+        if self.current is not None and self.manual_subject.pop(self.current.name, None) is not None:
+            self.end_pick()
+            self.auto_apply_rule()
+
     def start_compose(self):
         if self.base is None or self.compose_busy:
             return
         if not self.crop_mode:  # варианты примеряются на рамке обрезки
             self.a_crop.setChecked(True)
             self.toggle_crop()
-        W, H = self.full_wh
         self.compose_busy = True
         self.compose_btn.setEnabled(False)
-        self.toast("Ищу главное на кадре и подбираю композицию…", 0)
-        sid = (self.scene_of.get(self.current.name) or [None])[0]
-        run_task(compose_job, self.current, self.base, MODELS_DIR, sid, W, H, self.params.get("angle", 0),
-                 self.cropper.aspect, done=self.on_composed, fail=self.on_compose_fail, pool=AI_POOL)
+        self.request_analysis(self._compose_ready)
 
-    def on_compose_fail(self, msg):
-        self.compose_busy = False
-        self.compose_btn.setEnabled(True)
-        self.toast(f"Авто-кадр не получился: {msg}", 8000)
+    def _compose_ready(self):
+        name = self.current.name if self.current else None
+        an = self.analysis.get(name)
+        if an is None or not self.crop_mode:
+            if an is None and self.base is not None:
+                self.request_analysis(self._compose_ready)
+                return
+            self.compose_busy = False
+            self.compose_btn.setEnabled(True)
+            return
+        W, H = self.full_wh
+        angle = self.params.get("angle", 0)
+        variants = C.plan(an, W, H, angle, self._auto_aspect(), None, self.manual_subject.get(name))
+        small = E.resize_max(self.base, 260)
+        thumbs = [to_u8(E.apply_crop(small, v["rect"], angle, (W, H))) for v in variants]
+        thumbs.insert(0, to_u8(E.apply_crop(small, None, angle, (W, H))))
+        info = {"genre": an["genre"], "subject": (an["subject"] or {}).get("how") if not self.manual_subject.get(name)
+                else "ваша точка"}
+        self.on_composed((self.current, variants, thumbs, info))
 
     def on_composed(self, res):
         self.compose_busy = False
@@ -2274,17 +2429,17 @@ class MainWindow(QMainWindow):
         self.crop_carousel.blockSignals(False)
         if not variants:
             self.crop_carousel.hide()
-            self.toast("Нечего улучшать: нет главного объекта и горизонта — оставьте кадр как есть", 8000)
+            self.toast("Нечего улучшать: главное не найдено — щёлкните по нему на кадре", 8000)
+            self.begin_pick()
             return
         self.crop_carousel.show()
         fade_in(self.crop_carousel)
-        what = {"face": "лицо", "person": "человек", "object": "заметный объект", None: "горизонт"}[info["subject"]]
-        self.toast(f"Авто-кадр ({GENRE_RU.get(info['genre'], '')}): главное — {what}. "
+        self.toast(f"Авто-кадр ({GENRE_RU.get(info['genre'], '')}): главное — {info['subject'] or 'горизонт'}. "
                    "Щелчок — примерить, Enter — применить, Esc — отмена", 10000)
 
     def on_compose_pick(self, row: int):
         """Примерка варианта: рамка встаёт на место, сетка переключается на правило варианта."""
-        if row < 0 or not self.crop_mode:
+        if row < 0 or not self.crop_mode or row - 1 >= len(self.compose_variants):
             return
         W, H = self.full_wh
         angle = self.params.get("angle", 0)
@@ -2295,7 +2450,9 @@ class MainWindow(QMainWindow):
             v = self.compose_variants[row - 1]
             self.cropper.rect = list(v["rect"])
             self.cropper.aspect = v["aspect"]
+            self._silent_overlay = True  # вариант уже посчитан: повторно кадрировать под правило не нужно
             self.cropper.set_overlay(v["overlay"])
+            self._silent_overlay = False
             self.cropper.flip = v["flip"]
             self.toast(f"{v['label']}: {v['why']}", 8000)
         self.view.update()
@@ -2639,6 +2796,8 @@ class MainWindow(QMainWindow):
             return
         a = self._aspect_value(idx)
         self._apply_aspect(a)
+        if a and self.crop_mode and self.auto_rule.isChecked():
+            self.auto_apply_rule()
 
     def flip_aspect(self):
         if self.base is None:
@@ -2703,20 +2862,28 @@ class MainWindow(QMainWindow):
             self.editor.set_layer(None)
             self.crop_mode = True
             self.view.editor = self.cropper
-            for a in (self.a_crop_done, self.a_crop_cancel, self.a_overlay, self.a_overlay_rot):
+            for a in (self.a_crop_done, self.a_crop_cancel, self.a_overlay, self.a_overlay_rot, self.a_tool_prev,
+                      self.a_tool_next):
                 a.setEnabled(True)
             self.a_mask_show.setEnabled(False)
             self.qbar.hide()  # место под кадром — для вариантов авто-кадра
             self.view.marks = []  # рамки брака в обрезке мешают
             self.sections["Обрезка и горизонт"].set_expanded(True, emit=False)  # элементы рамки — внутри этой группы
             self.toast("Тяните рамку и её углы; «Горизонт» — поворот. Enter — готово, Esc — отмена", 10000)
+            if self.auto_rule.isChecked() and self._crop_is_default():
+                QTimer.singleShot(0, self.auto_apply_rule)  # правило уже выбрано — кадр сразу по нему
         else:
             self.crop_mode = False
             self.view.editor = self.editor
-            for a in (self.a_crop_done, self.a_crop_cancel, self.a_overlay, self.a_overlay_rot):
+            for a in (self.a_crop_done, self.a_crop_cancel, self.a_overlay, self.a_overlay_rot, self.a_tool_prev,
+                      self.a_tool_next):
                 a.setEnabled(False)
+            self.end_pick()
             self.a_mask_show.setEnabled(True)
             self.crop_carousel.hide()
+            self.crop_carousel.blockSignals(True)
+            self.crop_carousel.clear()
+            self.crop_carousel.blockSignals(False)
             self.compose_variants = []
             self.show_quality()
             self._set_crop(self.cropper.rect)
@@ -2730,6 +2897,8 @@ class MainWindow(QMainWindow):
     def rotate_overlay(self):
         if self.cropper.rotate_overlay():
             self.view.update()
+            if self.crop_mode and self.auto_rule.isChecked():  # зеркало спирали/треугольника — кадр под него
+                self.auto_apply_rule(self.cropper.flip)
 
     def on_overlay_pick(self, i: int):
         """Выбор сетки в списке: сетка видна только на рамке обрезки, поэтому режим включаем сами."""
@@ -2745,11 +2914,16 @@ class MainWindow(QMainWindow):
         self.overlay_combo.setCurrentIndex([k for k, _ in OVERLAYS].index(kind))
         self.overlay_combo.blockSignals(False)
         self.remember(overlay=kind)
-        if self.crop_mode:
+        if self.crop_mode and self.auto_rule.isChecked() and not self._silent_overlay:
+            self.auto_apply_rule()  # выбрали правило — кадр сразу перекадрирован под него, без подтверждений
+        elif self.crop_mode:
             self.toast(f"Сетка: {dict(OVERLAYS)[kind]}" + (" · Shift+O — повернуть" if kind in ROTATABLE else ""), 3000)
 
     def cancel_crop(self):
         if not self.crop_mode:
+            return
+        if self.pick_mode:  # Esc при выборе точки отменяет только выбор
+            self.end_pick()
             return
         self.params.update(self.crop_backup or {})
         self.cropper.rect = list(self.params.get("crop") or [0, 0, 1, 1])

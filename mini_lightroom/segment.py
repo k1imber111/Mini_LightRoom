@@ -30,6 +30,9 @@ CATEGORIES = {
     "greenery": ("Зелень", ("tree", "grass", "plant", "field", "palm", "flower")),
     "water": ("Вода", ("water", "sea", "river", "lake", "swimming")),
     "buildings": ("Здания", ("building", "house", "skyscraper", "tower", "bridge", "wall")),
+    # Предметы: птицы и звери, корабли, техника — то, что чаще всего главное в кадре (авто-кадр, маска «Предметы»)
+    "objects": ("Предметы", ("animal", "boat", "ship", "airplane", "car", "bus", "truck", "bicycle", "minibike",
+                             "sculpture", "fountain", "tower", "flower")),
 }
 
 

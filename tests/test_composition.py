@@ -100,4 +100,70 @@ if __name__ == "__main__":
     for f in range(4):
         ex, ey = C._spiral_eye(f)
         assert 0 < ex < 1 and 0 < ey < 1 and (ex, ey) == (CO.spiral()[-1] if f == 0 else (ex, ey))
+    # все семь правил дают ровно один лучший вариант, объект встаёт на силовую точку именно этого правила
+    obj = {"kind": "object", "point": (0.62, 0.45), "box": (0.55, 0.36, 0.69, 0.54), "facing": 0}
+    for rule in C.RULES:
+        vs = C.suggest(W, H, 0, obj, None, "other", aspect=1.5, rules=(rule,))
+        assert len(vs) == 1 and vs[0]["rule"] == rule and vs[0]["overlay"] == rule, (rule, vs)
+        v = vs[0]
+        assert inside(obj["box"], v["rect"]) > 0.95 and E.crop_valid(W, H, v["rect"], 0), rule
+        pix = (v["rect"][2] - v["rect"][0]) * W / ((v["rect"][3] - v["rect"][1]) * H)
+        assert abs(pix - 1.5) < 2e-3, (rule, pix)  # пропорция не меняется
+        rx, ry = rel(obj["point"], v["rect"])
+        anchors = C._anchors(rule, False, 1.5, v["flip"] if rule in ("spiral", "triangle") else None)
+        assert min(np.hypot(rx - ax, ry - ay) for ax, ay, _ in anchors) < 0.08, (rule, rx, ry)
+    # только горизонт (объекта нет): каждое правило ставит его на свою линию
+    for rule in C.RULES:
+        vs = C.suggest(W, H, 0, None, 0.5, "landscape", aspect=1.5, rules=(rule,))
+        assert len(vs) == 1, rule
+        h = rel((0.5, 0.5), vs[0]["rect"])[1]
+        lines = C.HORIZON_LINES.get(rule, (1 / 3, 2 / 3))
+        assert min(abs(h - ln) for ln in lines) < 0.07, (rule, h)
+    assert C.suggest(W, H, 0, None, None, "landscape", rules=("thirds",)) == []
+    # зафиксированное положение спирали/треугольника
+    for fl in range(4):
+        assert C.suggest(W, H, 0, obj, None, "other", aspect=1.5, rules=("spiral",), flip=fl)[0]["flip"] == fl
+        assert C.suggest(W, H, 0, obj, None, "other", aspect=1.5, rules=("triangle",), flip=fl)[0]["flip"] == fl
+    # план по анализу кадра: поворот холста и точка, указанная вручную, заменяет найденный объект
+    an = {"subject": None, "horizon": None, "genre": "other", "weight": None}
+    assert C.plan(an, W, H, 0, 1.5, ("thirds",)) == []
+    vs = C.plan(an, W, H, 3.0, 1.5, ("phi",), manual=(0.7, 0.4))
+    assert len(vs) == 1 and E.crop_valid(W, H, vs[0]["rect"], 3.0)
+    sub, _ = C.analysis_to_canvas(an, W, H, 3.0, (0.7, 0.4))
+    rx, ry = rel(sub["point"], vs[0]["rect"])
+    assert min(np.hypot(rx - ax, ry - ay) for ax, ay, _ in C._anchors("phi", False, 1.5)) < 0.08
+    sub0, hor0 = C.analysis_to_canvas({"subject": {"kind": "object", "point": (0.3, 0.6), "box": (0.2, 0.5, 0.4, 0.7)},
+                                       "horizon": 0.55}, W, H, 0)
+    assert sub0["point"] == (0.3, 0.6) and abs(hor0 - 0.55) < 1e-9, "без поворота координаты не меняются"
+
+    # главный объект: яркий диск на тёмном фоне находится, текстура и облака без явного пятна — нет
+    import cv2
+    moon = np.full((400, 600, 3), 0.02, np.float32)
+    cv2.circle(moon, (330, 170), 28, (0.9, 0.9, 0.85), -1, cv2.LINE_AA)
+    b = C.isolated_blob(moon)
+    assert b and abs(b["point"][0] - 330 / 600) < 0.03 and abs(b["point"][1] - 170 / 400) < 0.04, b
+    assert 0.03 < b["box"][2] - b["box"][0] < 0.2, "рамка пятна — порядка размера диска, а не втрое больше"
+    rng = np.random.default_rng(3)
+    texture = cv2.GaussianBlur(rng.random((400, 600, 3), dtype=np.float32), (0, 0), 6) * 2.5
+    assert C.isolated_blob(np.clip(texture, 0, 1)) is None, "ровная текстура — объекта нет"
+    sky = np.tile(np.linspace(0.2, 0.8, 400, dtype=np.float32)[:, None, None], (1, 600, 3)).copy()
+    for y in (120, 190, 260):
+        cv2.line(sky, (0, y), (600, y + 10), (1.0, 0.5, 0.2), 14)  # несколько похожих полос облаков
+    assert C.isolated_blob(sky) is None, "несколько похожих деталей — не изолированный объект"
+    # предмет из сегментации: одна цапля среди прочего; две близких по размеру — группа; мелочь ниже порога — нет
+    objs = np.zeros((100, 150), np.float32)
+    objs[40:60, 70:80] = 1.0
+    s = C.subject_from(None, None, objs)
+    assert s["kind"] == "object" and s["how"] == "предмет" and 0.45 < s["point"][0] < 0.55
+    objs2 = objs.copy()
+    objs2[40:58, 100:110] = 1.0
+    s2 = C.subject_from(None, None, objs2)
+    assert s2["box"][2] > 0.65, "пара похожих по размеру предметов — одна группа"
+    tiny = np.zeros((1000, 1500), np.float32)
+    tiny[500:502, 700:702] = 1.0
+    assert C.subject_from(None, None, tiny) is None, "точка в пару пикселей — не объект"
+    # лицо важнее человека, человек — предмета, предмет — пятна
+    face_first = C.subject_from([face_in], people, objs, moon)
+    assert face_first["kind"] == "face" and C.subject_from(None, people, objs, moon)["kind"] == "person"
+    assert C.subject_from(None, None, objs, moon)["how"] == "предмет" and C.subject_from(None, None, None, moon)["how"] == "яркое пятно"
     print("композиция OK")

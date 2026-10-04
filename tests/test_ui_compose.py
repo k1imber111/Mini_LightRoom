@@ -28,14 +28,13 @@ def wait(app, cond, timeout=120):
     raise TimeoutError("не дождались")
 
 
-def frame() -> np.ndarray:
-    """Небо-градиент, тёмная земля и яркий круг справа — главный объект не в центре."""
+def frame(cx: int = 1100, cy: int = 420) -> np.ndarray:
+    """Тёмное небо с мягким градиентом и яркий диск (как луна) не в центре: главный объект находится сам."""
     h, w = 1000, 1500
     y = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]
-    img = np.broadcast_to(np.array([0.2, 0.35, 0.7], np.float32) * (1 - y) + np.array([0.9, 0.6, 0.4], np.float32) * y,
+    img = np.broadcast_to(np.array([0.02, 0.04, 0.12], np.float32) * (1 - y) + np.array([0.08, 0.08, 0.16], np.float32) * y,
                           (h, w, 3)).copy()
-    img[620:] = (0.06, 0.08, 0.05)
-    cv2.circle(img, (1100, 420), 150, (1.0, 0.95, 0.2), -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), 110, (0.95, 0.93, 0.85), -1, cv2.LINE_AA)
     return img
 
 

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
-from PySide6.QtCore import QPoint, Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from test_ui_cull import motion, save, scene  # noqa: E402
@@ -113,6 +113,10 @@ def main(n_actions: int, seed: int) -> None:
             (lambda: win.look_combo.setCurrentIndex(rng.randrange(win.look_combo.count())), 2),
             (lambda: win.rows["look_strength"].slider.setValue(rng.randint(0, 100)), 1),
             (lambda: win.grab(), 2),
+            (lambda: win.a_tool_next.trigger(), 4), (lambda: win.a_tool_prev.trigger(), 3),
+            (lambda: win.begin_pick(), 2), (lambda: win.reset_subject(), 1), (lambda: win.auto_rule.toggle(), 1),
+            (lambda: win.on_subject_pick(QPointF(rng.randint(0, v.width()), rng.randint(0, v.height()))), 3),
+            (lambda: win.cancel_crop(), 1), (lambda: win.a_overlay_rot.trigger(), 2),
         ]
         if real:
             actions += [

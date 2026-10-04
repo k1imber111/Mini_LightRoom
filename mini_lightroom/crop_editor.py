@@ -31,6 +31,7 @@ class CropEditor(QObject):
         self._drag = None
         self.overlay = "thirds"  # вид сетки-подсказки (crop_overlays.OVERLAYS)
         self.flip = 0            # положение спирали/треугольника: 4 зеркала
+        self.pick_cb = None      # режим «укажите главное»: следующий щелчок отдаётся сюда (позиция в виджете)
 
     def active(self) -> bool:
         return True
@@ -83,6 +84,10 @@ class CropEditor(QObject):
     def press(self, e, view) -> bool:
         if e.button() != Qt.LeftButton or not view.pix:
             return False
+        if self.pick_cb is not None:  # щелчок — не рамка, а указание главного
+            cb, self.pick_cb = self.pick_cb, None
+            cb(e.position())
+            return True
         pos = e.position()
         for name, p in self._handles(view).items():
             if math.dist((p.x(), p.y()), (pos.x(), pos.y())) <= HANDLE + 4:

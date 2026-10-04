@@ -14,6 +14,14 @@
     "macro": {"contain": 2.0, "anchor": 1.5, "headroom": 0.0, "lead": 0.5, "horizon": 0.0, "kept": 1.0, "size": 0.8},
     "other": {"contain": 1.5, "anchor": 1.0, "headroom": 0.5, "lead": 0.5, "horizon": 1.5, "kept": 1.0, "size": 1.0}
   },
+  "rule_prior": {
+    "landscape": {"center": 0.7, "diagonal": 0.9, "grid": 0.9},
+    "portrait": {"center": 0.85, "grid": 0.9},
+    "architecture": {"center": 1.1},
+    "street": {"center": 0.9, "grid": 0.9},
+    "macro": {"grid": 0.9},
+    "other": {"grid": 0.9}
+  },
   "scene_genre": {
     "portrait": "portrait", "people": "portrait",
     "landscape": "landscape", "sea": "landscape", "forest": "landscape", "snow": "landscape", "fog": "landscape",
