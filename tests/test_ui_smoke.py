@@ -35,6 +35,7 @@ if __name__ == "__main__":
     styles_tmp = tempfile.TemporaryDirectory(prefix="стили_")
     ui.STYLES_DIR = Path(styles_tmp.name)  # не трогаем настоящую библиотеку стилей
     ui.SETTINGS_FILE = Path(styles_tmp.name) / "settings.json"  # и настоящую память сессии
+    ui.FC.available = lambda: False  # без лиц: тест не должен зависеть от mediapipe и сети
     with tempfile.TemporaryDirectory(prefix="съёмка_") as d:
         d = Path(d)
         rng = np.random.default_rng(1)
@@ -50,9 +51,7 @@ if __name__ == "__main__":
         win.load_folder(d)
         wait(app, lambda: win.after is not None)
         print("первый рендер готов, авто-экспозиция:", win.params["exposure"])
-        wait(app, lambda: len(win.scores) == 4)
-        print("размытые:", win.blurry)
-        assert "кадр_3.jpg" in win.blurry
+        wait(app, lambda: len(win.thumbs) == 4)  # миниатюры всех кадров готовы (проверка брака — tests/test_ui_cull.py)
 
         win.rows["contrast"].slider.setValue(40)
         win.rows["vibrance"].slider.setValue(25)

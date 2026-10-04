@@ -141,6 +141,16 @@ QStatusBar::item { border: none; }
 QSplitter::handle { background: transparent; }
 QSplitter::handle:horizontal { width: 6px; }
 
+QFrame#qbar { background: @window@; border: 1px solid @border@; border-radius: 12px; }
+QLabel#qpill { border-radius: 12px; padding: 3px 12px; font-weight: 600; background: @control@; color: @text2@; }
+QLabel#qpill[level="bad"] { background: @bad_soft@; color: @bad@; }
+QLabel#qpill[level="doubt"] { background: @warn_soft@; color: @warn@; }
+QLabel#qpill[level="ok"] { background: @ok_soft@; color: @ok@; }
+QPushButton[chip="true"] { min-height: 16px; padding: 3px 10px; border-radius: 12px; background: transparent;
+    border: 1px solid @border@; color: @text2@; }
+QPushButton[chip="true"]:hover { background: @hover@; color: @text@; }
+QPushButton[chip="true"]:checked { background: @accent_soft@; border-color: transparent; color: @accent@; }
+
 QLabel#toast { background: @panel@; color: @text@; border: 1px solid @border@; border-radius: 16px; padding: 8px 16px; }
 """
 

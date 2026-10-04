@@ -110,10 +110,11 @@ class Toast(QLabel):
 
     def place(self) -> None:
         """Ставит по центру внизу родителя; вызывать при смене размера окна."""
-        a = self.anchor.geometry()
+        a = self.anchor
+        top_left = a.mapTo(self.parentWidget(), a.rect().topLeft())  # якорь может лежать глубже окна
         self.setMaximumWidth(max(240, int(a.width() * 0.7)))
         self.adjustSize()
-        self.move(a.x() + (a.width() - self.width()) // 2, a.bottom() - self.height() - 28)
+        self.move(top_left.x() + (a.width() - self.width()) // 2, top_left.y() + a.height() - self.height() - 24)
 
     def _fade(self, to: float, ms: int) -> None:
         self._anim.stop()

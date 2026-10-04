@@ -28,6 +28,7 @@ EAR_MAX = 0.18     # ниже — глаз почти закрыт (открыт
 MIN_EYE_PX = 14    # глаз у́же этого на анализируемом изображении: судить нельзя («не проверено»)
 _LOCK = threading.Lock()
 _finder: FaceFinder | None = None
+_download_failed = False
 
 
 def available() -> bool:
@@ -123,8 +124,10 @@ def get_finder(models_dir: Path) -> FaceFinder | None:
         return _finder
     if not available():
         return None
+    global _download_failed
     path = Path(models_dir) / MODEL_FILE
-    if not path.exists() and not _download(path):
+    if not path.exists() and (_download_failed or not _download(path)):
+        _download_failed = True  # нет сети — не пытаться заново на каждом кадре
         return None
     _finder = FaceFinder(path.read_bytes())
     return _finder

@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-import statistics
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -12,6 +11,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import (
     QByteArray,
+    QFile,
     QObject,
     QPointF,
     QRectF,
@@ -33,6 +33,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QPainterPath,
+    QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -69,14 +70,28 @@ from PySide6.QtWidgets import (
 
 from . import engine as E
 from . import enhance as N
+from . import faces as FC
 from . import grading as GR
 from . import masks as MK
+from . import quality as Q
 from . import scene as S
 from . import segment as G
 from .crop_editor import CropEditor
 from .crop_overlays import OVERLAYS, ROTATABLE
 from .curve_editor import CURVE_SHAPES, CurveEditor
 from .mask_editor import MaskEditor
+from .quality_ui import (
+    LEVEL_COLOR,
+    SHORT,
+    TYPE_TEXT,
+    FilterBar,
+    QualityBar,
+    TrashDialog,
+    ZoomTile,
+    badge_icon,
+    describe,
+    numpy_pixmap,
+)
 from .target_editor import TargetEditor
 from .theme import T, apply_theme, tool_icon
 from .widgets import Section, Toast
@@ -87,6 +102,9 @@ LOOKS_DIR = APP_DIR / "looks"
 SCENES_FILE = APP_DIR / "scenes.json"
 MODELS_DIR = APP_DIR / "models"
 SCENES_KEY = "__scenes__"   # в sidecar: {имя файла: [id сцены, уверенность]}
+QUALITY_KEY = "__quality__"  # в sidecar: {имя файла: результат quality.analyze_file}
+FLAGS_KEY = "__flags__"      # в sidecar: {имя файла: "reject" | "pick"} — решение пользователя
+META_KEYS = (SCENES_KEY, QUALITY_KEY, FLAGS_KEY)  # служебные ключи sidecar: это не правки кадров
 PRESETS_DIR = APP_DIR / "presets"
 SETTINGS_FILE = APP_DIR / "settings.json"  # последняя папка и кадр, окно, галочки — между запусками
 SIDECAR = ".mini_lightroom.json"   # настройки кадров лежат рядом со снимками
@@ -171,8 +189,7 @@ def to_u8(img: np.ndarray) -> np.ndarray:
 
 
 def thumb_job(path):
-    th = E.load_thumb(path, 512)
-    return path, E.resize_max(th, 200), E.sharpness(th)
+    return path, E.resize_max(E.load_thumb(path, 512), 200)
 
 
 def preview_job(path):
@@ -203,6 +220,24 @@ def look_icons_job(path, base, params, style, looks):
 
 def scene_job(scenes, names, thumbs):
     return names, S.get_classifier(scenes, MODELS_DIR).classify(thumbs)
+
+
+def faces_job(path, models_dir):
+    """Лица и глаза кадра (MediaPipe) — только из AI_POOL. None — нет mediapipe или модели."""
+    finder = FC.get_finder(models_dir)
+    return path, (finder.detect(E.load_thumb(path, 2400)) if finder else None)
+
+
+def quality_job(path, faces):
+    """Брак кадра: резкость и смаз по области лица/точки АФ/лучшим местам + закрытые глаза."""
+    rois = Q.face_rois(faces or [])
+    res = Q.analyze_file(path, rois)
+    return path, (Q.add_eyes(res, rois) if rois else res)
+
+
+def tiles_job(path, boxes):
+    """Крупные (100%) вырезки мест брака из полноразмерного кадра."""
+    return path, Q.crop_tiles(Q.load_rgb(path)[0], boxes)
 
 
 def style_job(path, name):
@@ -357,6 +392,7 @@ class ImageView(QWidget):
         self.message = "Откройте папку со снимками\nCtrl+O или кнопка «Открыть папку»"
         self.badge = ""
         self.editor = None  # MaskEditor / CropEditor: забирает левую кнопку
+        self.marks: list[tuple] = []  # рамки брака: (рамка в долях кадра, уровень, подпись)
         # Обрезка: A — полный кадр (пиксели) → показанный кадр; src_w×src_h — размер показанного кадра.
         self.A = np.array([[1.0, 0, 0], [0, 1.0, 0]])
         self.Ainv = self.A.copy()
@@ -427,6 +463,14 @@ class ImageView(QWidget):
         r = QRectF(self.cx - self.width() / 2 / s, self.cy - self.height() / 2 / s,
                    self.width() / s, self.height() / s)
         return r.intersected(QRectF(0, 0, self.src_w, self.src_h))
+
+    def focus_on(self, xn: float, yn: float, zoom: float = 1.0):
+        """Показать точку кадра (в долях полного кадра) в центре на заданном масштабе (1.0 — 100%)."""
+        self.zoom = zoom if zoom > self.fit_scale() * 1.001 else None
+        self.cx, self.cy = (float(v) for v in self.A @ (xn * self.full_w, yn * self.full_h, 1.0))
+        self._clamp()
+        self.update()
+        self.view_changed.emit()
 
     def set_zoom(self, z: float | None, anchor: QPointF | None = None):
         """Меняет масштаб, оставляя точку под anchor (координаты виджета) на месте."""
@@ -507,6 +551,23 @@ class ImageView(QWidget):
         super().resizeEvent(e)
         self.view_changed.emit()
 
+    def _paint_marks(self, p: QPainter):
+        """Рамки мест брака: цвет — серьёзность, подпись над рамкой."""
+        p.setRenderHint(QPainter.Antialiasing)
+        for box, level, label in self.marks:
+            r = QRectF(self.to_widget_pt(box[0], box[1]), self.to_widget_pt(box[2], box[3])).normalized()
+            col = QColor(LEVEL_COLOR.get(level, "#e2685f"))
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(col, 2))
+            p.drawRoundedRect(r, 6, 6)
+            tag = p.fontMetrics().boundingRect(label).adjusted(-7, -3, 7, 3)
+            tag.moveBottomLeft(r.topLeft().toPoint())
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(tag, 6, 6)
+            p.setPen(QColor("#101010"))
+            p.drawText(tag, Qt.AlignCenter, label)
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#161616"))
@@ -524,6 +585,7 @@ class ImageView(QWidget):
                 p.drawPixmap(self.to_widget(rect), dpix, QRectF(dpix.rect()))
             if self.editor is not None:
                 self.editor.paint(p, self)
+            self._paint_marks(p)
         if self.badge:
             p.setPen(QColor("#ffffff"))
             r = p.fontMetrics().boundingRect(self.badge).adjusted(-8, -4, 8, 4)
@@ -638,7 +700,7 @@ class ExportDialog(QDialog):
         self.scene_look.setEnabled(has_scenes)
         self.scene_look.setToolTip("Каждый кадр получит авто-тон и пресет своей сцены (закат, портрет, лес…).\n"
                                    "Доступно после кнопки «Сцены» на панели.")
-        self.skip_blur = QCheckBox("Пропускать размытые кадры")
+        self.skip_blur = QCheckBox("Пропускать брак (расфокус, смаз, закрытые глаза)")
         self.edge = QSpinBox()
         self.edge.setRange(0, 12000)
         self.edge.setSingleStep(500)
@@ -726,8 +788,12 @@ class MainWindow(QMainWindow):
         self.files: list[Path] = []
         self.items: dict[str, QListWidgetItem] = {}
         self.sidecar: dict[str, dict] = {}
-        self.scores: dict[str, float] = {}
-        self.blurry: set[str] = set()
+        self.quality: dict[str, dict] = {}   # результаты проверки брака (quality.py); в sidecar под QUALITY_KEY
+        self.flags: dict[str, str] = {}      # решение пользователя: "reject" | "pick"
+        self.thumb_pix: dict[str, QPixmap] = {}
+        self.q_gen = 0                       # поколение проверки: результаты прежней папки отбрасываются
+        self.q_left = self.q_total = 0       # сколько кадров ещё проверяется / всего в этом запуске
+        self.tile_cache: dict[tuple, list] = {}
         self.current: Path | None = None
         self.base: np.ndarray | None = None
         self.before: QImage | None = None
@@ -783,6 +849,8 @@ class MainWindow(QMainWindow):
         self.editor.created.connect(self.on_mask_created)
         self.thumb_pool = QThreadPool()
         self.thumb_pool.setMaxThreadCount(2)
+        self.quality_pool = QThreadPool()  # резкость и смаз: numpy/OpenCV, без torch и mediapipe
+        self.quality_pool.setMaxThreadCount(2)
         STYLES_DIR.mkdir(exist_ok=True)
         PRESETS_DIR.mkdir(exist_ok=True)
 
@@ -871,6 +939,16 @@ class MainWindow(QMainWindow):
         self.scene_auto.setChecked(True)
         self.scene_auto.setToolTip("«Авто» и новые кадры получают пресет своей сцены.\n"
                                    "Работает для кадров, у которых сцена уже определена")
+        self.a_quality = self._action("Фокус", lambda: self.start_quality(force=True), "Ctrl+Shift+F",
+                                      "Проверить резкость, смаз и закрытые глаза у всех кадров папки заново",
+                                      icon="focus-2")
+        tb.addAction(self.a_quality)
+        self.quality_auto = QCheckBox("Проверять фокус при открытии папки")
+        self.quality_auto.setChecked(True)
+        self.quality_auto.setToolTip("После загрузки миниатюр в фоне ищется брак: расфокус, смаз, закрытые глаза.\n"
+                                     "Результат хранится рядом со снимками; кадры, которые не менялись, не пересчитываются")
+        self.a_reject = self._action("Брак", lambda: self.toggle_flag("reject"), "X", "Пометить кадр браком / снять")
+        self.a_pick = self._action("Оставить", lambda: self.toggle_flag("pick"), "U", "Оставить кадр (не бракуем) / снять")
         self.a_zoom_out = self._action("", lambda: self.view.step_zoom(-1), "Ctrl+-", "Уменьшить масштаб", icon="minus")
         self.a_zoom_in = self._action("", lambda: self.view.step_zoom(1), "Ctrl+=", "Увеличить масштаб", icon="plus")
         self.a_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
@@ -947,6 +1025,7 @@ class MainWindow(QMainWindow):
         al = QVBoxLayout(box.body)
         al.addWidget(self.auto_on_open)
         al.addWidget(self.scene_auto)
+        al.addWidget(self.quality_auto)
         pl.addWidget(box)
 
         box = self._section("Обрезка и горизонт")
@@ -1251,13 +1330,36 @@ class MainWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.panel = panel
 
+        self.filter_bar = FilterBar()
+        self.filter_bar.changed.connect(lambda _m: self.apply_filter())
+        self.trash_btn = QPushButton("В корзину…")
+        self.trash_btn.setIcon(tool_icon("trash"))
+        self.trash_btn.setToolTip("Отправить брак в корзину Windows. Только после вашего подтверждения; из корзины можно вернуть")
+        self.trash_btn.clicked.connect(self.trash_rejected)
+        self.trash_btn.hide()
+        left = QWidget()
+        left.setMinimumWidth(300)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 8)
+        ll.setSpacing(0)
+        ll.addWidget(self.filter_bar)
+        ll.addWidget(self.strip, 1)
+        trash_row = QHBoxLayout()
+        trash_row.setContentsMargins(8, 6, 8, 0)
+        trash_row.addWidget(self.trash_btn)
+        ll.addLayout(trash_row)
         split = QSplitter()
-        split.addWidget(self.strip)
+        split.addWidget(left)
         center = QWidget()
         cvl2 = QVBoxLayout(center)
         cvl2.setContentsMargins(0, 0, 0, 0)
         cvl2.setSpacing(4)
         cvl2.addWidget(self.view, 1)
+        self.qbar = QualityBar()
+        self.qbar.keep.connect(lambda: self.toggle_flag("pick"))
+        self.qbar.reject.connect(lambda: self.toggle_flag("reject"))
+        self.qbar.zoom_to.connect(self.zoom_to_roi)
+        cvl2.addWidget(self.qbar)
         self.carousel = QListWidget()
         self.carousel.setViewMode(QListWidget.IconMode)
         self.carousel.setFlow(QListWidget.LeftToRight)
@@ -1275,9 +1377,9 @@ class MainWindow(QMainWindow):
         split.addWidget(center)
         split.addWidget(scroll)
         split.setStretchFactor(1, 1)
-        split.setSizes([240, 870, 390])
+        split.setSizes([300, 810, 390])
         self.setCentralWidget(split)
-        self.toaster = Toast(self, split)
+        self.toaster = Toast(self, self.view)
 
     def _build_status(self):
         self.progress = QProgressBar()
@@ -1303,7 +1405,8 @@ class MainWindow(QMainWindow):
         self.panel.setEnabled(on)
         for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_export,
                   self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100, self.a_scenes,
-                  self.a_undo, self.a_redo, self.a_crop, self.a_grade, self.a_enhance, self.a_match):
+                  self.a_undo, self.a_redo, self.a_crop, self.a_grade, self.a_enhance, self.a_match,
+                  self.a_quality, self.a_reject, self.a_pick):
             a.setEnabled(on)
         self.zoom_combo.setEnabled(on)
 
@@ -1326,7 +1429,7 @@ class MainWindow(QMainWindow):
         if st.get("geometry"):
             self.restoreGeometry(QByteArray.fromHex(st["geometry"].encode()))
         for box, key in ((self.auto_on_open, "auto_on_open"), (self.scene_auto, "scene_auto"),
-                         (self.crop_cam, "crop_cam")):
+                         (self.crop_cam, "crop_cam"), (self.quality_auto, "quality_auto")):
             if key in st:
                 box.setChecked(bool(st[key]))
         folder = Path(st["last_folder"]) if st.get("last_folder") else None
@@ -1359,8 +1462,14 @@ class MainWindow(QMainWindow):
         self.history_dirty = False
         self.scene_of = dict(self.sidecar.get(SCENES_KEY, {}))
         self.thumbs.clear()
-        self.scores.clear()
-        self.blurry.clear()
+        self.q_gen += 1
+        self.q_left = self.q_total = 0
+        self.thumb_pix.clear()
+        self.tile_cache.clear()
+        self.quality = dict(self.sidecar.get(QUALITY_KEY, {}))
+        self.flags = dict(self.sidecar.get(FLAGS_KEY, {}))
+        self.qbar.hide()
+        self.view.marks = []
         self.items.clear()
         self.cache.clear()
         self.grade_cache.clear()  # варианты карусели — по именам кадров этой папки
@@ -1382,37 +1491,263 @@ class MainWindow(QMainWindow):
             self.strip.addItem(it)
             self.items[p.name] = it
             run_task(thumb_job, p, done=self.on_thumb, pool=self.thumb_pool)
-        self.toast(f"Снимков в папке: {len(self.files)}. Проверяю резкость…")
+        self.toast(f"Снимков в папке: {len(self.files)}. Загружаю миниатюры…")
         self.strip.setCurrentRow(0)
 
     def on_thumb(self, res):
-        path, th, score = res
-        it = self.items.get(Path(path).name)
-        if it is None:
+        path, th = res
+        name = Path(path).name
+        if name not in self.items:
             return
-        it.setIcon(QIcon(QPixmap.fromImage(to_qimage(th))))
-        self.scores[Path(path).name] = score
-        self.thumbs[Path(path).name] = th
-        self.update_item(Path(path).name)
-        if len(self.scores) == len(self.files) and len(self.files) >= 3:
-            med = statistics.median(self.scores.values())
-            self.blurry = {n for n, s in self.scores.items() if s < med * 0.3}
-            for n in self.items:
-                self.update_item(n)
-            self.toast(f"Резкость проверена: подозрительно размытых {len(self.blurry)}")
+        self.thumbs[name] = th
+        self.thumb_pix[name] = QPixmap.fromImage(to_qimage(th))
+        self.update_item(name)
+        if len(self.thumbs) == len(self.files):  # миниатюры готовы — теперь можно искать брак
+            self.refresh_cull()
+            if self.quality_auto.isChecked():
+                self.start_quality()
+
+    def effective(self, name: str) -> str:
+        """Итог по кадру: решение пользователя важнее авто-вердикта. ok | doubt | bad | unknown."""
+        flag = self.flags.get(name)
+        if flag:
+            return "bad" if flag == "reject" else "ok"
+        return (self.quality.get(name) or {}).get("verdict", "unknown")
+
+    def cull_candidates(self) -> list[str]:
+        """Кадры, которые предлагаем в корзину: помеченные вами и найденные браком, кроме оставленных вами."""
+        return [n for n in self.items if self.effective(n) == "bad"]
+
+    def cull_rejects(self) -> set[str]:
+        return set(self.cull_candidates())
 
     def update_item(self, name: str):
-        """Подпись кадра в ленте: имя, пометка размытости, сцена."""
+        """Подпись и значок кадра в ленте: имя, статус брака или решение, сцена."""
         it = self.items.get(name)
         if it is None:
             return
-        lines = [f"⚠ {name}", "возможно, размыт"] if name in self.blurry else [name]
+        level, title, _ = describe(self.quality.get(name), self.flags.get(name))
+        lines = [name]
+        if level in ("bad", "doubt") or self.flags.get(name):
+            defects = (self.quality.get(name) or {}).get("defects") or []
+            why = f" · {SHORT.get(defects[0]['type'], '')}" if defects and not self.flags.get(name) else ""
+            lines.append(title + why)
         sc = self.scene_by_id.get(self.scene_of.get(name, [None])[0])
         if sc:
             lines.append(f"{sc.get('icon', '')} {sc['name']}")
         it.setText("\n".join(lines))
-        if name in self.blurry:
-            it.setForeground(QColor("#ff9b73"))
+        pix = self.thumb_pix.get(name)
+        if pix is not None:
+            flag = self.flags.get(name)
+            it.setIcon(badge_icon(pix, flag or (level if level in ("bad", "doubt") else None)))
+
+    # ---------- проверка брака
+
+    def start_quality(self, force: bool = False):
+        """Брак всех кадров папки в фоне: лица (AI_POOL, mediapipe) → резкость и смаз (2 потока). Готовые
+        результаты из sidecar берутся, если файл не менялся и метрика та же."""
+        if not self.files or self.q_left:
+            if self.q_left:
+                self.toast("Проверка фокуса уже идёт", 3000)
+            return
+        todo = []
+        for p in self.files:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            res = self.quality.get(p.name)
+            if force or not res or res.get("file") != [st.st_size, int(st.st_mtime)] or res.get("v") != Q.CFG["version"]:
+                todo.append(p)
+        if not todo:
+            self.refresh_cull()
+            self.apply_filter()
+            return
+        todo.sort(key=lambda p: p != self.current)  # открытый кадр — первым
+        self.q_gen += 1
+        gen = self.q_gen
+        self.q_left = self.q_total = len(todo)
+        self.toast(f"Проверка фокуса: 0 из {len(todo)}…", 0)
+        for p in todo:
+            if FC.available():
+                run_task(faces_job, p, MODELS_DIR, done=lambda r, g=gen: self._q_after_faces(r, g),
+                         fail=lambda _m, g=gen, p=p: self._q_after_faces((p, None), g), pool=AI_POOL)
+            else:
+                self._q_after_faces((p, None), gen)
+
+    def _q_after_faces(self, res, gen):
+        if gen != self.q_gen:
+            return
+        path, faces = res
+        run_task(quality_job, path, faces, done=lambda r, g=gen: self.on_quality(r, g),
+                 fail=lambda m, g=gen, p=path: self.on_quality(
+                     (p, {"verdict": "unknown", "defects": [], "regions": [], "error": m}), g),
+                 pool=self.quality_pool)
+
+    def on_quality(self, res, gen):
+        if gen != self.q_gen:
+            return
+        path, r = res
+        name = Path(path).name
+        self.quality[name] = r
+        self.q_left -= 1
+        self.update_item(name)
+        if self.current is not None and self.current.name == name:
+            self.show_quality()
+        done = self.q_total - self.q_left
+        if self.q_left:
+            if done % 4 == 0:
+                self.toast(f"Проверка фокуса: {done} из {self.q_total}…", 0)
+            return
+        bad = sum(self.effective(n) == "bad" for n in self.items)
+        doubt = sum(self.effective(n) == "doubt" for n in self.items)
+        self.refresh_cull()
+        self.apply_filter()
+        self.toast(f"Проверка фокуса готова: брак {bad}, сомнительно {doubt}, из {len(self.items)}", 8000)
+        self.save_timer.start()
+
+    def refresh_cull(self):
+        """Счётчики фильтров и кнопка корзины."""
+        counts = {"all": len(self.items), "bad": 0, "doubt": 0, "ok": 0}
+        for n in self.items:
+            v = self.effective(n)
+            if v in counts:
+                counts[v] += 1
+        self.filter_bar.set_counts(counts)
+        n = counts["bad"]
+        self.trash_btn.setVisible(n > 0)
+        self.trash_btn.setText(f"В корзину ({n})…")
+
+    def apply_filter(self):
+        mode = self.filter_bar.mode()
+        for name, it in self.items.items():
+            it.setHidden(mode != "all" and self.effective(name) != mode)
+
+    def toggle_flag(self, flag: str):
+        if self.current is None:
+            return
+        name = self.current.name
+        if self.flags.get(name) == flag:
+            self.flags.pop(name)
+        else:
+            self.flags[name] = flag
+        self.update_item(name)
+        self.show_quality()
+        self.refresh_cull()
+        self.apply_filter()
+        self.save_timer.start()
+
+    def _tile_specs(self, res: dict) -> list[tuple]:
+        """Плитки полосы: (рамка, заголовок, подпись, уровень) — места брака и для сравнения самое резкое место кадра."""
+        specs = []
+        for d in (res.get("defects") or [])[:3]:
+            if not d.get("roi"):
+                continue
+            title = TYPE_TEXT.get(d["type"], d["type"]) + (f" · {d['name']}" if d["name"] != "Кадр" else "")
+            if d["type"] == "motion":
+                sub = f"направление {d['angle']:.0f}°, размытие {d['sigma']:.1f} px"
+            elif d["type"] == "eyes_closed":
+                sub = "веки опущены"
+            else:
+                best = "лучшее место · " if d["name"] == "Кадр" else "размытие "
+                sub = f"{best}{d['sigma']:.1f} px (норма ≤ {Q.CFG['soft_doubt']:.1f})"
+            specs.append((d["roi"], title, sub, d["level"]))
+        ref = res.get("ref")
+        if specs and ref and all(abs(sp[0][0] - ref[0]) > 1e-6 for sp in specs):
+            specs.append((ref, "Самое резкое место кадра", f"размытие {res.get('best_sigma', 0):.1f} px", "ok"))
+        return specs
+
+    def show_quality(self):
+        """Полоса под фото и рамки на кадре для текущего снимка."""
+        name = self.current.name if self.current else None
+        res, flag = self.quality.get(name), self.flags.get(name)
+        marks = []
+        for d in (res or {}).get("defects", []):
+            if d.get("roi") and not flag:
+                marks.append((d["roi"], d["level"], TYPE_TEXT.get(d["type"], d["type"])))
+        self.view.marks = marks
+        self.view.update()
+        if name is None or (res is None and not flag and not self.q_left):
+            self.qbar.hide()
+            return
+        self.qbar.show_result(res, flag)
+        specs = self._tile_specs(res) if res else []
+        if not specs:
+            self.qbar.set_tiles([])
+            return
+        key = (name, tuple(res.get("file") or ()), res.get("v"))
+        if key in self.tile_cache:
+            self._put_tiles(specs, self.tile_cache[key])
+        else:
+            run_task(tiles_job, self.current, [sp[0] for sp in specs],
+                     done=lambda r, k=key: self.on_tiles(r, k), fail=lambda _m: self.qbar.set_tiles([]))
+
+    def on_tiles(self, res, key):
+        _path, imgs = res
+        self.tile_cache[key] = imgs
+        if len(self.tile_cache) > 12:
+            self.tile_cache.pop(next(iter(self.tile_cache)))
+        if self.current is not None and self.current.name == key[0]:
+            self._put_tiles(self._tile_specs(self.quality.get(key[0]) or {}), imgs)
+
+    def _put_tiles(self, specs: list[tuple], imgs: list):
+        self.qbar.set_tiles([ZoomTile(numpy_pixmap(img), t, sub, lvl, box)
+                             for (box, t, sub, lvl), img in zip(specs, imgs, strict=False)])
+
+    def zoom_to_roi(self, box):
+        self.view.focus_on((box[0] + box[2]) / 2, (box[1] + box[3]) / 2, 1.0)
+
+    def _forget_frame(self, p: Path):
+        """Кадр ушёл в корзину: убираем его из ленты, кешей и правок."""
+        name = p.name
+        if self.current == p:
+            self.history_timer.stop()
+            self.current, self.base = None, None
+        it = self.items.pop(name, None)
+        if it is not None:
+            self.strip.takeItem(self.strip.row(it))
+        self.files = [f for f in self.files if f != p]
+        for d in (self.thumbs, self.thumb_pix, self.sidecar, self.scene_of, self.quality, self.flags, self.history,
+                  self.isos, self.cam_aspects, self.grade_cache):
+            d.pop(name, None)
+        self.cache.pop(p, None)
+        self.history_dirty = True
+        for f in (self.folder / MASKS_DIR).glob(f"{name}.*.png"):  # ИИ-маски этого кадра — туда же
+            QFile.moveToTrash(str(f))
+
+    def trash_rejected(self):
+        """Брак в корзину Windows. RAW уходит только после подтверждения в диалоге и только в корзину."""
+        names = self.cull_candidates()
+        if not names or self.folder is None:
+            return
+        rows = []
+        for n in names:
+            path = self.folder / n
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            rows.append((path, self.thumb_pix.get(n), describe(self.quality.get(n), self.flags.get(n))[1], size))
+        dlg = TrashDialog(self, rows)
+        if not dlg.exec():
+            return
+        moved, failed = [], []
+        for path in dlg.chosen():
+            r = QFile.moveToTrash(str(path))
+            (moved if (r[0] if isinstance(r, tuple) else r) else failed).append(path)
+        for path in moved:
+            self._forget_frame(path)
+        if moved and not self.files:
+            self.view.set_image(None)
+            self.view.message = "В папке не осталось снимков"
+            self.view.update()
+            self._set_enabled(False)
+        self.save_sidecar()
+        self.refresh_cull()
+        self.apply_filter()
+        self.show_quality()
+        msg = f"В корзину отправлено кадров: {len(moved)}. Вернуть можно из корзины Windows"
+        self.toast(msg + (f". Не удалось: {len(failed)}" if failed else ""), 10000)
 
     # ---------- выбор кадра
 
@@ -1426,6 +1761,7 @@ class MainWindow(QMainWindow):
         self.store_current()
         self.current = Path(item.data(PATH_ROLE))
         self.remember(last_file=self.current.name)
+        self.show_quality()
         self.base = None
         self.full = self.full_path = None
         self.base_dn = None
@@ -1488,6 +1824,11 @@ class MainWindow(QMainWindow):
         self.store_current()
         if self.scene_of:
             self.sidecar[SCENES_KEY] = self.scene_of
+        for key, data in ((QUALITY_KEY, self.quality), (FLAGS_KEY, self.flags)):
+            if data:
+                self.sidecar[key] = data
+            else:
+                self.sidecar.pop(key, None)
         if self.folder and self.sidecar:
             try:
                 E.write_json(self.folder / SIDECAR, self.sidecar)
@@ -2673,7 +3014,7 @@ class MainWindow(QMainWindow):
 
     def _replace_style_refs(self, old: str, new: str):
         """Меняет имя стиля в правках текущего кадра и всех кадров открытой папки."""
-        for p in [self.params, *(v for k, v in self.sidecar.items() if k != SCENES_KEY)]:
+        for p in [self.params, *(v for k, v in self.sidecar.items() if k not in META_KEYS)]:
             for key in ("style", "style2"):
                 if p.get(key) == old:
                     p[key] = new
@@ -2852,9 +3193,9 @@ class MainWindow(QMainWindow):
         else:
             paths = [self.current]
         if dlg.skip_blur.isChecked():
-            paths = [p for p in paths if p.name not in self.blurry]
+            paths = [p for p in paths if p.name not in self.cull_rejects()]
         if not paths:
-            self.toast("Нечего экспортировать: все выбранные кадры отмечены как размытые")
+            self.toast("Нечего экспортировать: все выбранные кадры отмечены как брак")
             return
         opts = {"out": Path(dlg.out.text()), "scene": dlg.scene_look.isChecked(), "auto": dlg.auto.isChecked(),
                 "upscale": (0, 2, 4)[dlg.upscale.currentIndex()],
@@ -2938,7 +3279,7 @@ class MainWindow(QMainWindow):
         self.save_sidecar()
         self.remember(geometry=bytes(self.saveGeometry().toHex()).decode(),
                       auto_on_open=self.auto_on_open.isChecked(), scene_auto=self.scene_auto.isChecked(),
-                      crop_cam=self.crop_cam.isChecked())
+                      crop_cam=self.crop_cam.isChecked(), quality_auto=self.quality_auto.isChecked())
         if self.export_thread:
             self.export_thread.stop = True
             self.export_thread.wait()

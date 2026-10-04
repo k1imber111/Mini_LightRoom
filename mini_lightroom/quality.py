@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 
 import cv2
@@ -19,7 +20,8 @@ import rawpy
 
 from . import engine as E
 
-__all__ = ["CFG", "af_point", "analyze_file", "analyze_gray", "energy_grid", "load_gray", "region_sigma"]
+__all__ = ["CFG", "add_eyes", "af_point", "analyze_file", "analyze_gray", "crop_tiles", "energy_grid", "face_rois",
+           "load_gray", "load_rgb", "region_sigma"]
 
 APP_DIR = Path(__file__).resolve().parent.parent
 QUALITY_FILE = APP_DIR / "quality.json"
@@ -35,29 +37,42 @@ _FLIP = {3: cv2.ROTATE_180, 5: cv2.ROTATE_90_COUNTERCLOCKWISE, 6: cv2.ROTATE_90_
 
 # ---------------------------------------------------------------- загрузка
 
-def load_gray(path) -> tuple[np.ndarray, int]:
-    """Серый uint8 кадр в полном разрешении, повёрнутый как в окне, и flip из RAW (для пересчёта точки АФ).
-    RAW: встроенный JPEG (у Sony полноразмерный, без демозаики); маленький JPEG — проявка в половину размера."""
+def _load(path, color: bool) -> tuple[np.ndarray, int]:
     path = Path(path)
     data = E._read_bytes(path)
+    flag = cv2.IMREAD_COLOR if color else cv2.IMREAD_GRAYSCALE
     if path.suffix.lower() not in E.RAW_EXT:
-        g = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
-        if g is None:
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), flag)
+        if img is None:
             raise ValueError(f"Не удалось прочитать файл {path.name}")
-        return g, 0
+        return (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if color else img), 0
     with rawpy.imread(io.BytesIO(data)) as raw:
         flip = getattr(raw.sizes, "flip", 0)
-        g = None
+        img = None
         try:
             th = raw.extract_thumb()
             if th.format == rawpy.ThumbFormat.JPEG:
-                g = cv2.imdecode(np.frombuffer(th.data, np.uint8), cv2.IMREAD_GRAYSCALE | cv2.IMREAD_IGNORE_ORIENTATION)
+                img = cv2.imdecode(np.frombuffer(th.data, np.uint8), flag | cv2.IMREAD_IGNORE_ORIENTATION)
+                if img is not None and color:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         except Exception:  # noqa: BLE001 — нет встроенного JPEG: проявим сами
-            g = None
-        if g is None or max(g.shape) < 0.5 * max(raw.sizes.width, raw.sizes.height):
-            rgb = raw.postprocess(half_size=True, use_camera_wb=True, no_auto_bright=True, output_bps=8)
-            g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    return (cv2.rotate(g, _FLIP[flip]) if flip in _FLIP else g), flip
+            img = None
+        if img is None or max(img.shape[:2]) < 0.5 * max(raw.sizes.width, raw.sizes.height):
+            img = raw.postprocess(half_size=True, use_camera_wb=True, no_auto_bright=True, output_bps=8)
+            if not color:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    return (cv2.rotate(img, _FLIP[flip]) if flip in _FLIP else img), flip
+
+
+def load_gray(path) -> tuple[np.ndarray, int]:
+    """Серый uint8 кадр в полном разрешении, повёрнутый как в окне, и flip из RAW (для пересчёта точки АФ).
+    RAW: встроенный JPEG (у Sony полноразмерный, без демозаики); маленький JPEG — проявка в половину размера."""
+    return _load(path, False)
+
+
+def load_rgb(path) -> tuple[np.ndarray, int]:
+    """То же в цвете (RGB uint8): для вырезок-плиток «где именно брак»."""
+    return _load(path, True)
 
 
 def af_point(path, flip: int = 0) -> tuple[float, float] | None:
@@ -250,7 +265,7 @@ def analyze_gray(g8: np.ndarray, rois: list[dict] | None = None, af: tuple | Non
         judge({"name": "Кадр", "box": None}, 0)
     if levels:
         res["verdict"] = max(levels, key=LEVELS.index)
-    return res
+    return json.loads(json.dumps(res, default=float))
 
 
 def analyze_file(path, rois: list[dict] | None = None) -> dict:
@@ -299,3 +314,21 @@ def add_eyes(res: dict, rois: list[dict]) -> dict:
             res["verdict"] = level
     res["faces"] = [{"name": r["name"], "box": r["face"]["box"], "closed": r["face"].get("closed")} for r in rois]
     return res
+
+
+def crop_tiles(rgb: np.ndarray, boxes: list[list[float]], size: tuple[int, int] = (240, 160)) -> list[np.ndarray]:
+    """Вырезки для плиток «где именно брак»: окно size вокруг центра каждой области, в натуральных пикселях
+    (100% — так видна реальная резкость); область больше окна уменьшается, чтобы поместиться целиком."""
+    H, W = rgb.shape[:2]
+    tw, th = size
+    out = []
+    for x0, y0, x1, y1 in boxes:
+        bw, bh = max(1.0, (x1 - x0) * W), max(1.0, (y1 - y0) * H)
+        s = min(1.0, 0.85 * tw / bw, 0.85 * th / bh)  # масштаб показа: ≤ 100%
+        ww, wh = min(W, tw / s), min(H, th / s)         # окно в пикселях кадра
+        cx, cy = (x0 + x1) / 2 * W, (y0 + y1) / 2 * H
+        l, t = int(min(max(cx - ww / 2, 0), W - ww)), int(min(max(cy - wh / 2, 0), H - wh))
+        win = rgb[t: t + int(wh), l: l + int(ww)]
+        out.append(np.ascontiguousarray(cv2.resize(win, (tw, th), interpolation=cv2.INTER_AREA if s < 1 else
+                                                   cv2.INTER_NEAREST)))
+    return out
