@@ -9,8 +9,11 @@ if not exist ".venv\Scripts\python.exe" (
 echo Ставлю библиотеки ИИ для сцен, масок, шумодава и увеличения: PyTorch с CUDA, около 3 ГБ, один раз...
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check --retries 5 --timeout 60 torch torchvision --index-url https://download.pytorch.org/whl/cu128 || goto fail
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt -r requirements-ai.txt || goto fail
+rem mediapipe ставит свою копию OpenCV (contrib) поверх headless: оставляем одну
+".venv\Scripts\python.exe" -m pip uninstall -y opencv-contrib-python >nul 2>&1
+".venv\Scripts\python.exe" -m pip install --disable-pip-version-check --force-reinstall --no-deps opencv-python-headless || goto fail
 echo.
-echo Готово. Перезапустите Mini LightRoom: заработают «Сцены», маски «✨ ИИ», шумодав и увеличение.
+echo Готово. Перезапустите Mini LightRoom: заработают «Сцены», маски «ИИ», шумодав, увеличение и проверка закрытых глаз.
 pause
 exit /b 0
 :fail

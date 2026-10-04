@@ -4,3 +4,4 @@
 open_clip_torch
 transformers   # маски ИИ (этап 3): SegFormer ADE20K
 spandrel       # шумодав SCUNet и увеличение Real-ESRGAN (этап 4)
+mediapipe      # лица и закрытые глаза при проверке брака; тянет opencv-contrib-python — install_ai.bat его убирает

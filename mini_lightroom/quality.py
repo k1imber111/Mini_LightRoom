@@ -259,3 +259,43 @@ def analyze_file(path, rois: list[dict] | None = None) -> dict:
     out = analyze_gray(g, rois, af_point(path, flip))
     out["file"] = [Path(path).stat().st_size, int(Path(path).stat().st_mtime)]  # для сброса кеша при замене файла
     return out
+
+
+# ---------------------------------------------------------------- лица и глаза (из faces.py)
+
+def face_rois(faces: list[dict], max_faces: int = 3) -> list[dict]:
+    """Области резкости из лиц (по убыванию площади): верхние 70% рамки лица — глаза, нос, брови.
+    Мелкие лица (уже 3% кадра) и сильно меньше главного не учитываются: далёкая толпа не бракует кадр."""
+    out = []
+    main = (faces[0]["box"][2] - faces[0]["box"][0]) * (faces[0]["box"][3] - faces[0]["box"][1]) if faces else 0
+    for f in faces:
+        x0, y0, x1, y1 = f["box"]
+        if x1 - x0 < 0.03 or (x1 - x0) * (y1 - y0) < 0.25 * main or len(out) >= max_faces:
+            continue
+        out.append({"name": "Лицо" if not out else f"Лицо {len(out) + 1}", "box": [x0, y0, x1, y0 + 0.7 * (y1 - y0)],
+                    "face": f})
+    return out
+
+
+def add_eyes(res: dict, rois: list[dict]) -> dict:
+    """Дописывает в результат закрытые глаза: у главного лица — «брак», у остальных — «сомнительно»; рамка — глаз."""
+    names = {"left": "Левый глаз", "right": "Правый глаз"}
+    for i, r in enumerate(rois):
+        f = r["face"]
+        closed = f.get("closed")
+        if closed is None:
+            r["eyes_checked"] = False  # глаза слишком мелкие: честно «не проверено»
+            continue
+        if not closed:
+            continue
+        both = len(closed) == 2
+        box = f["eyes"][closed[0]] if not both else [
+            min(f["eyes"]["left"][0], f["eyes"]["right"][0]), min(f["eyes"]["left"][1], f["eyes"]["right"][1]),
+            max(f["eyes"]["left"][2], f["eyes"]["right"][2]), max(f["eyes"]["left"][3], f["eyes"]["right"][3])]
+        level = "bad" if i == 0 else "doubt"
+        res["defects"].append({"type": "eyes_closed", "level": level, "name": "Глаза закрыты" if both else
+                               f"{names[closed[0]]} закрыт", "roi": box, "sigma": None, "face": r["name"]})
+        if res["verdict"] == "unknown" or LEVELS.index(level) > LEVELS.index(res["verdict"]):
+            res["verdict"] = level
+    res["faces"] = [{"name": r["name"], "box": r["face"]["box"], "closed": r["face"].get("closed")} for r in rois]
+    return res
