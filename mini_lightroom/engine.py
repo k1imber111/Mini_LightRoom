@@ -794,9 +794,11 @@ def process_view_region(full: np.ndarray, view_rect: tuple, scale: float, p: dic
     bx1, by1 = np.ceil(corners.max(0)) + 2
     box = (int(max(0, bx0)), int(max(0, by0)), int(min(W, bx1)), int(min(H, by1)))
     before, after = process_region(full, box, scale, p, style, src_stats, look, prep)
-    if not has_geometry(p):
-        return before, after
     k = after.shape[1] / (box[2] - box[0])
+    if not has_geometry(p):  # охватывающий кусок шире видимой области (запас ±2 px): вырезаем ровно её
+        ox, oy = round((vx0 - box[0]) * k), round((vy0 - box[1]) * k)
+        w, h = max(1, round((vx1 - vx0) * k)), max(1, round((vy1 - vy0) * k))
+        return before[oy:oy + h, ox:ox + w], after[oy:oy + h, ox:ox + w]
     b0 = np.array(box[:2], np.float64)
     M = np.hstack([A[:, :2], (k * (A[:, :2] @ b0 + A[:, 2] - np.array([vx0, vy0])))[:, None]]).astype(np.float32)
     size = (max(1, round((vx1 - vx0) * k)), max(1, round((vy1 - vy0) * k)))
