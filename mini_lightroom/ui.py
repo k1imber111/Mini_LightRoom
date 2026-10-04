@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -864,6 +865,7 @@ class MainWindow(QMainWindow):
         self.detail_timer = QTimer(self, singleShot=True, interval=150, timeout=self.request_detail)
         self.settle_timer = QTimer(self, singleShot=True, interval=SETTLE_MS, timeout=self.request_render)
         self.dirty_fast = False
+        self.last_edit = 0.0  # когда в последний раз просили перерисовать кадр (time.monotonic)
         self._fast: tuple | None = None  # (кадр, его уменьшенная копия)
         self.export_thread: ExportThread | None = None
         self.thumbs: dict[str, np.ndarray] = {}
@@ -1552,6 +1554,7 @@ class MainWindow(QMainWindow):
         self.thumbs.clear()
         self.q_gen += 1
         self.q_left = self.q_total = 0
+        self.thumb_failed: set[str] = set()
         self.thumb_pix.clear()
         self.tile_cache.clear()
         self.quality = dict(self.sidecar.get(QUALITY_KEY, {}))
@@ -1578,19 +1581,28 @@ class MainWindow(QMainWindow):
             it.setData(PATH_ROLE, str(p))
             self.strip.addItem(it)
             self.items[p.name] = it
-            run_task(thumb_job, p, done=self.on_thumb, pool=self.thumb_pool)
+            run_task(thumb_job, p, done=self.on_thumb, fail=lambda _m, p=p: self.on_thumb_fail(p), pool=self.thumb_pool)
         self.toast(f"Снимков в папке: {len(self.files)}. Загружаю миниатюры…")
         self.strip.setCurrentRow(0)
 
     def on_thumb(self, res):
         path, th = res
         name = Path(path).name
-        if name not in self.items:
-            return
+        if Path(path).parent != self.folder or name not in self.items:
+            return  # результат прежней папки (имена кадров могут совпасть) или уже убранного кадра
         self.thumbs[name] = th
         self.thumb_pix[name] = QPixmap.fromImage(to_qimage(th))
         self.update_item(name)
-        if len(self.thumbs) == len(self.files):  # миниатюры готовы — теперь можно искать брак
+        self._thumbs_settled()
+
+    def on_thumb_fail(self, path):
+        """Файл не читается: миниатюры не будет, но остальные кадры это не задерживает."""
+        if Path(path).parent == self.folder and Path(path).name in self.items:
+            self.thumb_failed.add(Path(path).name)
+            self._thumbs_settled()
+
+    def _thumbs_settled(self):
+        if len(self.thumbs) + len(self.thumb_failed) == len(self.files):  # миниатюры готовы — можно искать брак
             self.refresh_cull()
             if self.quality_auto.isChecked():
                 self.start_quality()
@@ -1666,6 +1678,9 @@ class MainWindow(QMainWindow):
     def _q_after_faces(self, res, gen):
         if gen != self.q_gen:
             return
+        if time.monotonic() - self.last_edit < 1.2:  # правите кадр: проверка брака конкурирует с рендером за процессор
+            QTimer.singleShot(600, lambda: self._q_after_faces(res, gen))
+            return
         path, faces = res
         run_task(quality_job, path, faces, done=lambda r, g=gen: self.on_quality(r, g),
                  fail=lambda m, g=gen, p=path: self.on_quality(
@@ -1677,7 +1692,8 @@ class MainWindow(QMainWindow):
             return
         path, r = res
         name = Path(path).name
-        self.quality[name] = r
+        if name in self.items:  # кадр могли убрать в корзину, пока он проверялся
+            self.quality[name] = r
         self.q_left -= 1
         self.update_item(name)
         if self.current is not None and self.current.name == name:
@@ -1988,6 +2004,7 @@ class MainWindow(QMainWindow):
         self.detail_pair = None
         if self.base is None:
             return
+        self.last_edit = time.monotonic()
         self.history_timer.start()  # правки «устоялись» 0.4 с — шаг истории (протяжка = один шаг)
         if fast and self.base.shape[1] > FAST_SIDE * 1.2:
             self.settle_timer.start()
@@ -1999,9 +2016,11 @@ class MainWindow(QMainWindow):
             return
         self.rendering = True
         self.gen += 1
-        dn = self.base_dn if self.params.get("denoise") and not fast else None
-        if self.params.get("denoise") and self.base_dn is None and not fast:
+        dn = self.base_dn if self.params.get("denoise") else None
+        if self.params.get("denoise") and dn is None and not fast:
             self.request_denoise()
+        if fast and dn is not None:
+            dn = E.resize_max(dn, FAST_SIDE)  # очищенное превью — того же размера, что быстрый кадр
         run_task(render_job, self.gen, self.fast_base() if fast else self.base, self.render_params(),
                  self.current_style(), self.current_look(), dn, self.display_geo(),
                  done=self.on_rendered, fail=self.on_render_fail)
