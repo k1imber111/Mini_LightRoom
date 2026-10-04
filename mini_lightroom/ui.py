@@ -113,6 +113,8 @@ HISTORY_FILE = ".mini_lightroom_history.json"  # шаги отмены кадр�
 HISTORY_KEEP = 50  # шагов на кадр в файле (в памяти — 100)
 MASKS_DIR = ".mini_lightroom_masks"  # ИИ-маски кадров (PNG) рядом со снимками
 PREVIEW_SIDE = 1400
+FAST_SIDE = 700      # при протяжке ползунка кадр считается уменьшенным: в разы быстрее, потом — полный
+SETTLE_MS = 200      # сколько тишины после последнего движения, прежде чем дорисовать полный кадр
 PATH_ROLE = Qt.UserRole
 # Цвета HSL: ключ движка, подпись, цвет метки.
 HSL_COLORS = [("red", "Красный", "#ff4d4d"), ("orange", "Оранжевый", "#ff9a3d"), ("yellow", "Жёлтый", "#f2d33b"),
@@ -860,6 +862,9 @@ class MainWindow(QMainWindow):
         self.detail_dirty = False
         self.detail_pair: tuple | None = None     # (до, после, место в кадре)
         self.detail_timer = QTimer(self, singleShot=True, interval=150, timeout=self.request_detail)
+        self.settle_timer = QTimer(self, singleShot=True, interval=SETTLE_MS, timeout=self.request_render)
+        self.dirty_fast = False
+        self._fast: tuple | None = None  # (кадр, его уменьшенная копия)
         self.export_thread: ExportThread | None = None
         self.thumbs: dict[str, np.ndarray] = {}
         self.scene_defs: list[dict] = E.read_json(SCENES_FILE, [])
@@ -1111,7 +1116,7 @@ class MainWindow(QMainWindow):
             self.overlay_combo.addItem(f"Сетка: {label}")
         self.overlay_combo.setCurrentIndex([k for k, _ in OVERLAYS].index(self.cropper.overlay))
         self.overlay_combo.setToolTip("Подсказка композиции на рамке обрезки (клавиша O листает, Shift+O поворачивает)")
-        self.overlay_combo.activated.connect(lambda i: self.cropper.set_overlay(OVERLAYS[i][0]))
+        self.overlay_combo.activated.connect(self.on_overlay_pick)
         self.cropper.overlay_changed.connect(self.on_overlay)
         cl.addWidget(self.overlay_combo)
         self.angle_row = SliderRow("angle_x10", "Горизонт", -450, 450)
@@ -1954,7 +1959,7 @@ class MainWindow(QMainWindow):
         self.params[key] = value
         if key in E.AI_SLIDER_CATS and value:
             self.ensure_ai_masks()  # маска для ретуши/боке досчитается в фоне, дальше кадр перерисуется
-        self.request_render()
+        self.request_render(fast=True)
 
     def current_style(self):
         return self.style_for(self.params)
@@ -1970,22 +1975,35 @@ class MainWindow(QMainWindow):
     def current_look(self):
         return self.looks.get(self.params.get("look") or "")
 
-    def request_render(self):
+    def fast_base(self) -> np.ndarray:
+        """Уменьшенная копия превью для быстрой перерисовки при протяжке (одна на кадр)."""
+        if self._fast is None or self._fast[0] is not self.base:
+            self._fast = (self.base, E.resize_max(self.base, FAST_SIDE))
+        return self._fast[1]
+
+    def request_render(self, fast: bool = False):
+        """Перерисовать кадр. fast=True — для непрерывных правок (протяжка ползунка, точки кривой): считается
+        уменьшенная копия, а полный кадр дорисовывается через SETTLE_MS после последнего движения."""
         self.detail_gen += 1  # деталь с прежними правками больше не годится
         self.detail_pair = None
         if self.base is None:
             return
         self.history_timer.start()  # правки «устоялись» 0.4 с — шаг истории (протяжка = один шаг)
+        if fast and self.base.shape[1] > FAST_SIDE * 1.2:
+            self.settle_timer.start()
+        else:
+            fast = False
+            self.settle_timer.stop()
         if self.rendering:
-            self.dirty = True
+            self.dirty, self.dirty_fast = True, fast  # последний запрос решает, каким будет следующий проход
             return
         self.rendering = True
         self.gen += 1
-        dn = self.base_dn if self.params.get("denoise") else None
-        if self.params.get("denoise") and dn is None:
+        dn = self.base_dn if self.params.get("denoise") and not fast else None
+        if self.params.get("denoise") and self.base_dn is None and not fast:
             self.request_denoise()
-        run_task(render_job, self.gen, self.base, self.render_params(), self.current_style(), self.current_look(), dn,
-                 self.display_geo(),
+        run_task(render_job, self.gen, self.fast_base() if fast else self.base, self.render_params(),
+                 self.current_style(), self.current_look(), dn, self.display_geo(),
                  done=self.on_rendered, fail=self.on_render_fail)
 
     def on_rendered(self, res):
@@ -1999,7 +2017,7 @@ class MainWindow(QMainWindow):
         self.detail_timer.start()
         if self.dirty:
             self.dirty = False
-            self.request_render()
+            self.request_render(self.dirty_fast)
 
     def on_render_fail(self, msg):
         self.rendering = False
@@ -2103,7 +2121,7 @@ class MainWindow(QMainWindow):
         if pts:
             curves[ch] = pts
         self.params["curve"] = curves
-        self.request_render()
+        self.request_render(fast=True)
 
     def on_curve_shape(self, idx: int):
         if idx > 0:
@@ -2124,7 +2142,7 @@ class MainWindow(QMainWindow):
         else:
             hsl.pop(color, None)
         self.params["hsl"] = hsl
-        self.request_render()
+        self.request_render(fast=True)
 
     def reset_hsl(self):
         self.params["hsl"] = {}
@@ -2396,7 +2414,7 @@ class MainWindow(QMainWindow):
         g = self.params.get("ai_grade")
         if g:
             self.params["ai_grade"] = {**g, "strength": value}
-            self.request_render()
+            self.request_render(fast=True)
 
     def _sync_grade(self):
         g = self.params.get("ai_grade")
@@ -2496,7 +2514,7 @@ class MainWindow(QMainWindow):
                     hsl.pop(color, None)
                 self.hsl_rows[(color, t["idx"])].set_value(vals[t["idx"]])
             self.params["hsl"] = hsl
-            self.request_render()
+            self.request_render(fast=True)
         else:
             pts = [list(q) for q in self.curve.points()]
             i = min(t["i"], len(pts) - 1)
@@ -2642,7 +2660,7 @@ class MainWindow(QMainWindow):
             self.cropper.angle, self.cropper.rect = angle, rect
         self._set_crop(rect)
         self.update_geometry()
-        self.request_render()
+        self.request_render(fast=True)
 
     def on_crop_rect(self):
         self._set_crop(self.cropper.rect)
@@ -2693,6 +2711,13 @@ class MainWindow(QMainWindow):
     def rotate_overlay(self):
         if self.cropper.rotate_overlay():
             self.view.update()
+
+    def on_overlay_pick(self, i: int):
+        """Выбор сетки в списке: сетка видна только на рамке обрезки, поэтому режим включаем сами."""
+        if self.base is not None and not self.crop_mode:
+            self.a_crop.setChecked(True)
+            self.toggle_crop()
+        self.cropper.set_overlay(OVERLAYS[i][0])
 
     def on_overlay(self, kind: str):
         """Вид сетки сменился (клавиша O или список): перерисовать, синхронизировать список, запомнить."""
@@ -2847,13 +2872,13 @@ class MainWindow(QMainWindow):
         self.toast("Готово. Теперь двигайте ползунки маски; ручки на кадре меняют форму")
 
     def on_mask_geom(self):
-        self.request_render()
+        self.request_render(fast=True)
         self.view.update()
 
     def on_mask_adj(self, key: str, value: int):
         if self.editor.layer is not None:
             self.editor.layer["adj"][key] = value
-            self.request_render()
+            self.request_render(fast=True)
 
     def on_mask_invert(self, on: bool):
         if self.editor.layer is not None:
