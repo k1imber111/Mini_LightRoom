@@ -1,4 +1,4 @@
-"""Рамка обрезки на кадре: затемнение снаружи, сетка третей, 8 ручек, перенос, пропорции.
+"""Рамка обрезки на кадре: затемнение снаружи, сетка-подсказка (трети, золотое сечение, спираль…), 8 ручек, перенос, пропорции.
 
 В режиме обрезки окно показывает весь повёрнутый холст, поэтому рамка — в долях этого холста
 (те же координаты, что params["crop"]). Рамка не выходит за снимок: engine.crop_valid.
@@ -8,8 +8,9 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 
+from . import crop_overlays as CO
 from . import engine as E
 
 __all__ = ["CropEditor"]
@@ -19,6 +20,7 @@ HANDLE = 8
 
 class CropEditor(QObject):
     changed = Signal()
+    overlay_changed = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -27,8 +29,26 @@ class CropEditor(QObject):
         self.aspect: float | None = None   # ширина/высота в пикселях; None — свободно
         self.size = (1.0, 1.0)             # полный кадр W×H в пикселях
         self._drag = None
+        self.overlay = "thirds"  # вид сетки-подсказки (crop_overlays.OVERLAYS)
+        self.flip = 0            # положение спирали/треугольника: 4 зеркала
 
     def active(self) -> bool:
+        return True
+
+    def set_overlay(self, kind: str) -> None:
+        if kind in dict(CO.OVERLAYS) and kind != self.overlay:
+            self.overlay, self.flip = kind, 0
+            self.overlay_changed.emit(kind)
+
+    def cycle_overlay(self, step: int = 1) -> None:
+        ids = [k for k, _ in CO.OVERLAYS]
+        self.set_overlay(ids[(ids.index(self.overlay) + step) % len(ids)])
+
+    def rotate_overlay(self) -> bool:
+        """Зеркалит спираль/треугольник; у остальных сеток поворачивать нечего (False)."""
+        if self.overlay not in CO.ROTATABLE:
+            return False
+        self.flip = (self.flip + 1) % 4
         return True
 
     # ---------- геометрия рамки
@@ -154,12 +174,11 @@ class CropEditor(QObject):
         p.fillRect(QRectF(full.left(), box.top(), box.left() - full.left(), box.height()), dim)
         p.fillRect(QRectF(box.right(), box.top(), full.right() - box.right(), box.height()), dim)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(QPen(QColor(255, 255, 255, 110), 1))
-        for i in (1, 2):  # сетка третей
-            x = box.left() + box.width() * i / 3
-            y = box.top() + box.height() * i / 3
-            p.drawLine(QPointF(x, box.top()), QPointF(x, box.bottom()))
-            p.drawLine(QPointF(box.left(), y), QPointF(box.right(), y))
+        spiral = self.overlay == "spiral"
+        p.setPen(QPen(QColor(255, 255, 255, 190 if spiral else 110), 1.8 if spiral else 1))
+        for path in CO.lines(self.overlay, self.flip, box.width() / max(box.height(), 1e-6)):
+            p.drawPolyline(QPolygonF([QPointF(box.left() + x * box.width(), box.top() + y * box.height())
+                                      for x, y in path]))
         p.setPen(QPen(QColor("#ffffff"), 1.5))
         p.drawRect(box)
         p.setPen(QPen(QColor(0, 0, 0, 180), 1.5))

@@ -175,6 +175,21 @@ if __name__ == "__main__":
         # обрезка: пропорции, рамка мышью, горизонт, маски поверх обрезки, масштаб
         win.a_crop.trigger()
         assert win.crop_mode and win.view.editor is win.cropper and (win.view.src_w, win.view.src_h) == (900, 600)
+        # сетки-подсказки: O листает только в обрезке (там маска не подсвечивается), список и настройки следуют за ней
+        assert win.a_overlay.isEnabled() and not win.a_mask_show.isEnabled()
+        assert win.cropper.overlay == "thirds" and win.overlay_combo.currentIndex() == 0
+        win.a_overlay.trigger()
+        assert win.cropper.overlay == "phi" and win.overlay_combo.currentIndex() == 1
+        assert E.read_json(ui.SETTINGS_FILE, {}).get("overlay") == "phi"
+        win.cropper.set_overlay("spiral")
+        assert win.cropper.rotate_overlay() and win.cropper.flip == 1
+        win.cropper.set_overlay("thirds")
+        assert not win.cropper.rotate_overlay()
+        win.grab()  # все сетки рисуются без ошибок
+        for kind, _ in ui.OVERLAYS:
+            win.cropper.set_overlay(kind)
+            win.grab()
+        win.cropper.set_overlay("thirds")
         win.aspect_combo.setCurrentIndex(7)
         win.on_aspect(7)  # 16:9
         x0, y0, x1, y1 = win.cropper.rect

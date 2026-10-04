@@ -105,7 +105,8 @@ class Toast(QLabel):
         self.show()
         self.raise_()
         self._fade(1.0, 160)
-        self._timer.start(ms)
+        if ms > 0:  # 0 — держать, пока не придёт следующее сообщение
+            self._timer.start(ms)
 
     def place(self) -> None:
         """Ставит по центру внизу родителя; вызывать при смене размера окна."""

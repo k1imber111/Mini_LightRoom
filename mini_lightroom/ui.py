@@ -74,6 +74,7 @@ from . import masks as MK
 from . import scene as S
 from . import segment as G
 from .crop_editor import CropEditor
+from .crop_overlays import OVERLAYS, ROTATABLE
 from .curve_editor import CURVE_SHAPES, CurveEditor
 from .mask_editor import MaskEditor
 from .target_editor import TargetEditor
@@ -875,7 +876,13 @@ class MainWindow(QMainWindow):
         self.a_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
         self.a_fit = self._action("Вписать", lambda: self.view.set_zoom(None), "Ctrl+0")
         self.a_100 = self._action("100%", lambda: self.view.set_zoom(1.0), "Ctrl+1")
-        self._action("Показать маску", lambda: self.mask_show.toggle(), "O")
+        # O: в обрезке — вид сетки, вне её — подсветка маски (две одинаковые клавиши включены по очереди)
+        self.a_mask_show = self._action("Показать маску", lambda: self.mask_show.toggle(), "O")
+        self.a_overlay = self._action("Вид сетки", self.cycle_overlay, "O", "Сетка-подсказка: трети, золотое сечение, спираль…")
+        self.a_overlay_rot = self._action("Повернуть сетку", self.rotate_overlay, "Shift+O")
+        self.a_overlay.setEnabled(False)
+        self.a_overlay_rot.setEnabled(False)
+        self.cropper.overlay = self.settings.get("overlay", "thirds") if self.settings.get("overlay") in dict(OVERLAYS)             else "thirds"
         self.zoom_combo = QComboBox()
         self.zoom_combo.addItem("Вписать")
         self.zoom_combo.addItems([f"{round(z * 100)}%" for z in ZOOM_STEPS])
@@ -958,6 +965,14 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self.flip_aspect)
         row.addWidget(b)
         cl.addLayout(row)
+        self.overlay_combo = QComboBox()
+        for _, label in OVERLAYS:
+            self.overlay_combo.addItem(f"Сетка: {label}")
+        self.overlay_combo.setCurrentIndex([k for k, _ in OVERLAYS].index(self.cropper.overlay))
+        self.overlay_combo.setToolTip("Подсказка композиции на рамке обрезки (клавиша O листает, Shift+O поворачивает)")
+        self.overlay_combo.activated.connect(lambda i: self.cropper.set_overlay(OVERLAYS[i][0]))
+        self.cropper.overlay_changed.connect(self.on_overlay)
+        cl.addWidget(self.overlay_combo)
         self.angle_row = SliderRow("angle_x10", "Горизонт", -450, 450)
         self.angle_row.setToolTip("Поворот для выравнивания горизонта. Рамка сама сжимается, чтобы не было пустых углов")
         self.angle_row.changed.connect(lambda _k, v: self.on_angle(v / 10))
@@ -2161,19 +2176,38 @@ class MainWindow(QMainWindow):
             self.editor.set_layer(None)
             self.crop_mode = True
             self.view.editor = self.cropper
-            self.a_crop_done.setEnabled(True)
-            self.a_crop_cancel.setEnabled(True)
+            for a in (self.a_crop_done, self.a_crop_cancel, self.a_overlay, self.a_overlay_rot):
+                a.setEnabled(True)
+            self.a_mask_show.setEnabled(False)
             self.sections["Обрезка и горизонт"].set_expanded(True, emit=False)  # элементы рамки — внутри этой группы
             self.toast("Тяните рамку и её углы; «Горизонт» — поворот. Enter — готово, Esc — отмена", 10000)
         else:
             self.crop_mode = False
             self.view.editor = self.editor
-            self.a_crop_done.setEnabled(False)
-            self.a_crop_cancel.setEnabled(False)
+            for a in (self.a_crop_done, self.a_crop_cancel, self.a_overlay, self.a_overlay_rot):
+                a.setEnabled(False)
+            self.a_mask_show.setEnabled(True)
             self._set_crop(self.cropper.rect)
             self.toast("Обрезка применена. Ctrl+Z — отменить")
         self.update_geometry()
         self.request_render()
+
+    def cycle_overlay(self):
+        self.cropper.cycle_overlay()
+
+    def rotate_overlay(self):
+        if self.cropper.rotate_overlay():
+            self.view.update()
+
+    def on_overlay(self, kind: str):
+        """Вид сетки сменился (клавиша O или список): перерисовать, синхронизировать список, запомнить."""
+        self.view.update()
+        self.overlay_combo.blockSignals(True)
+        self.overlay_combo.setCurrentIndex([k for k, _ in OVERLAYS].index(kind))
+        self.overlay_combo.blockSignals(False)
+        self.remember(overlay=kind)
+        if self.crop_mode:
+            self.toast(f"Сетка: {dict(OVERLAYS)[kind]}" + (" · Shift+O — повернуть" if kind in ROTATABLE else ""), 3000)
 
     def cancel_crop(self):
         if not self.crop_mode:

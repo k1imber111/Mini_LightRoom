@@ -64,5 +64,9 @@ if __name__ == "__main__":
         win.a_crop.trigger()
         pump(app, 1)
         win.grab().save(str(out / "3_crop_toast.png"))
+        for kind in ("spiral", "triangle", "phi"):  # сетки-подсказки композиции
+            win.cropper.set_overlay(kind)
+            pump(app, 0.3)
+            win.view.grab().save(str(out / f"4_overlay_{kind}.png"))
         win.close()
     print("снимки:", *sorted(str(p) for p in out.glob("*.png")), sep="\n")
