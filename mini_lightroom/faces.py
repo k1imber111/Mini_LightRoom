@@ -63,6 +63,9 @@ def eyes_state(pts: np.ndarray, blink: tuple[float, float], size: tuple[int, int
     out = {"eyes": {"left": _box(pts, EYE_A, 1.6), "right": _box(pts, EYE_B, 1.6)}, "blink": list(blink)}
     ears = [_ear(pts * (W, H), EAR_A), _ear(pts * (W, H), EAR_B)]
     out["ear"] = ears
+    # куда смотрит: кончик носа (точка 1) правее середины между глазами — вправо (доля расстояния между глазами)
+    mid = (pts[EYE_A, 0].mean() + pts[EYE_B, 0].mean()) / 2
+    out["yaw"] = float((pts[1, 0] - mid) / max(abs(pts[EYE_B, 0].mean() - pts[EYE_A, 0].mean()), 1e-6))
     width_px = [float(np.ptp(pts[EYE_A, 0]) * W), float(np.ptp(pts[EYE_B, 0]) * W)]
     out["eye_px"] = width_px
     if min(width_px) < MIN_EYE_PX:

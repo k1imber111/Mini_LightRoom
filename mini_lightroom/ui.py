@@ -68,6 +68,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import composition as C
 from . import engine as E
 from . import enhance as N
 from . import faces as FC
@@ -120,6 +121,8 @@ HSL_COLORS = [("red", "Красный", "#ff4d4d"), ("orange", "Оранжевы
 # Пропорции обрезки: подпись → ширина/высота; "cam" — как снимала камера, "orig" — как у RAW.
 ASPECTS = [("Свободно", None), ("Как в камере", "cam"), ("Исходное", "orig"), ("1:1", 1.0), ("4:5", 0.8),
            ("3:2", 1.5), ("4:3", 4 / 3), ("16:9", 16 / 9)]
+GENRE_RU = {"portrait": "портрет", "landscape": "пейзаж", "architecture": "архитектура", "street": "улица",
+            "macro": "макро", "other": "общий кадр"}
 SECTIONS_OPEN = ("ИИ-цветокоррекция", "Автоматика", "Свет", "Цвет")  # остальные группы панели свёрнуты, пока их не раскрыли
 ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 7, 10, 16]  # 1 = 100% (пиксель снимка = пиксель экрана)
 
@@ -238,6 +241,43 @@ def quality_job(path, faces):
 def tiles_job(path, boxes):
     """Крупные (100%) вырезки мест брака из полноразмерного кадра."""
     return path, Q.crop_tiles(Q.load_rgb(path)[0], boxes)
+
+
+def compose_job(path, base, models_dir, scene_id, W, H, angle, aspect):
+    """Авто-кадр: главное на кадре (лицо → человек → заметное пятно), горизонт, жанр → варианты кадрирования
+    с миниатюрами. Только из AI_POOL (сегментация, mediapipe)."""
+    img = _seg_input(base)
+    finder = FC.get_finder(models_dir) if FC.available() else None
+    faces = finder.detect(E.load_thumb(path, 1600)) if finder else []
+    maps = G.get_segmenter(models_dir).masks(img, ["people", "sky"]) if G.available() else {}
+    people = E.main_people(maps["people"]) if "people" in maps else None
+    salient = None
+    if not faces and people is None:
+        salient = G.refine(E.saliency_mask(img), img)
+        if salient.mean() < 0.02:  # заметное пятно меньше 2% кадра — не объект съёмки
+            salient = None
+    subject = C.subject_from(faces, people, salient)
+    horizon = E.horizon_level(maps.get("sky"))
+    A, _ = E.crop_matrix(W, H, None, angle)  # точки полного кадра → повёрнутый холст, где живёт рамка
+
+    def tp(x, y):
+        rx, ry = A @ (x * W, y * H, 1.0)
+        return float(rx / W), float(ry / H)
+
+    if subject:
+        subject["point"] = tp(*subject["point"])
+        xs, ys = zip(*(tp(x, y) for x in (subject["box"][0], subject["box"][2]) for y in (subject["box"][1], subject["box"][3])),
+                     strict=True)
+        subject["box"] = (min(xs), min(ys), max(xs), max(ys))
+    if horizon is not None:
+        horizon = tp(0.5, horizon)[1]
+    weight = salient if salient is not None else people
+    genre = C.genre_of(scene_id, bool(faces))
+    variants = C.suggest(W, H, angle, subject, horizon, genre, aspect, weight)
+    small = E.resize_max(base, 260)
+    thumbs = [to_u8(E.apply_crop(small, v["rect"], angle, (W, H))) for v in variants]
+    thumbs.insert(0, to_u8(E.apply_crop(small, None, angle, (W, H))))
+    return path, variants, thumbs, {"genre": genre, "subject": subject["kind"] if subject else None}
 
 
 def style_job(path, name):
@@ -794,6 +834,8 @@ class MainWindow(QMainWindow):
         self.q_gen = 0                       # поколение проверки: результаты прежней папки отбрасываются
         self.q_left = self.q_total = 0       # сколько кадров ещё проверяется / всего в этом запуске
         self.tile_cache: dict[tuple, list] = {}
+        self.compose_busy = False
+        self.compose_variants: list[dict] = []
         self.current: Path | None = None
         self.base: np.ndarray | None = None
         self.before: QImage | None = None
@@ -947,6 +989,8 @@ class MainWindow(QMainWindow):
         self.quality_auto.setChecked(True)
         self.quality_auto.setToolTip("После загрузки миниатюр в фоне ищется брак: расфокус, смаз, закрытые глаза.\n"
                                      "Результат хранится рядом со снимками; кадры, которые не менялись, не пересчитываются")
+        self.a_compose = self._action("Авто-кадр", self.start_compose, "Shift+C",
+                                      "Подобрать кадрирование по правилам композиции: объект, горизонт, взгляд")
         self.a_reject = self._action("Брак", lambda: self.toggle_flag("reject"), "X", "Пометить кадр браком / снять")
         self.a_pick = self._action("Оставить", lambda: self.toggle_flag("pick"), "U", "Оставить кадр (не бракуем) / снять")
         self.a_zoom_out = self._action("", lambda: self.view.step_zoom(-1), "Ctrl+-", "Уменьшить масштаб", icon="minus")
@@ -1070,6 +1114,13 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self.ai_thirds)
         row.addWidget(b)
         cl.addLayout(row)
+        self.compose_btn = QPushButton("Авто-кадр по композиции")
+        self.compose_btn.setIcon(tool_icon("sparkles"))
+        self.compose_btn.setToolTip("Находит главное (лицо, человек, заметный объект), горизонт и жанр кадра и предлагает\n"
+                                    "несколько кадрирований по правилам: трети, золотое сечение, спираль, симметрия.\n"
+                                    "Щелчок по варианту — примерить, Enter — применить (Shift+C)")
+        self.compose_btn.clicked.connect(self.start_compose)
+        cl.addWidget(self.compose_btn)
         row = QHBoxLayout()
         self.crop_cam = QCheckBox("Новые кадры — как в камере")
         self.crop_cam.setChecked(True)
@@ -1355,6 +1406,20 @@ class MainWindow(QMainWindow):
         cvl2.setContentsMargins(0, 0, 0, 0)
         cvl2.setSpacing(4)
         cvl2.addWidget(self.view, 1)
+        self.crop_carousel = QListWidget()  # варианты авто-кадра: настройки те же, что у карусели ИИ-цвета
+        self.crop_carousel.setViewMode(QListWidget.IconMode)
+        self.crop_carousel.setFlow(QListWidget.LeftToRight)
+        self.crop_carousel.setWrapping(False)
+        self.crop_carousel.setMovement(QListWidget.Static)
+        self.crop_carousel.setIconSize(QSize(168, 112))
+        self.crop_carousel.setGridSize(QSize(184, 150))
+        self.crop_carousel.setWordWrap(True)
+        self.crop_carousel.setFixedHeight(172)
+        self.crop_carousel.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.crop_carousel.setToolTip("Варианты кадрирования: щелчок — примерить, Enter — применить, Esc — отмена")
+        self.crop_carousel.currentRowChanged.connect(self.on_compose_pick)
+        self.crop_carousel.hide()
+        cvl2.addWidget(self.crop_carousel)
         self.qbar = QualityBar()
         self.qbar.keep.connect(lambda: self.toggle_flag("pick"))
         self.qbar.reject.connect(lambda: self.toggle_flag("reject"))
@@ -1406,7 +1471,7 @@ class MainWindow(QMainWindow):
         for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_export,
                   self.a_zoom_in, self.a_zoom_out, self.a_fit, self.a_100, self.a_scenes,
                   self.a_undo, self.a_redo, self.a_crop, self.a_grade, self.a_enhance, self.a_match,
-                  self.a_quality, self.a_reject, self.a_pick):
+                  self.a_quality, self.a_reject, self.a_pick, self.a_compose):
             a.setEnabled(on)
         self.zoom_combo.setEnabled(on)
 
@@ -2115,6 +2180,71 @@ class MainWindow(QMainWindow):
         self.toast(f"Правило третей: {what} на пересечении третей" + (", горизонт на трети" if horizon else "")
                    + ". Ctrl+Z — вернуть", 8000)
 
+    # ---------- авто-кадр по композиции
+
+    def start_compose(self):
+        if self.base is None or self.compose_busy:
+            return
+        if not self.crop_mode:  # варианты примеряются на рамке обрезки
+            self.a_crop.setChecked(True)
+            self.toggle_crop()
+        W, H = self.full_wh
+        self.compose_busy = True
+        self.compose_btn.setEnabled(False)
+        self.toast("Ищу главное на кадре и подбираю композицию…", 0)
+        sid = (self.scene_of.get(self.current.name) or [None])[0]
+        run_task(compose_job, self.current, self.base, MODELS_DIR, sid, W, H, self.params.get("angle", 0),
+                 self.cropper.aspect, done=self.on_composed, fail=self.on_compose_fail, pool=AI_POOL)
+
+    def on_compose_fail(self, msg):
+        self.compose_busy = False
+        self.compose_btn.setEnabled(True)
+        self.toast(f"Авто-кадр не получился: {msg}", 8000)
+
+    def on_composed(self, res):
+        self.compose_busy = False
+        self.compose_btn.setEnabled(True)
+        path, variants, thumbs, info = res
+        if path != self.current or not self.crop_mode:
+            return
+        self.compose_variants = variants
+        self.crop_carousel.blockSignals(True)
+        self.crop_carousel.clear()
+        for i, th in enumerate(thumbs):
+            v = variants[i - 1] if i else None
+            it = QListWidgetItem(QIcon(QPixmap.fromImage(to_qimage(th))),
+                                 "Исходный кадр" if v is None else f"{v['label']}\n{v['score'] * 100:.0f} из 100")
+            it.setToolTip("Весь кадр, без обрезки" if v is None else v["why"])
+            self.crop_carousel.addItem(it)
+        self.crop_carousel.blockSignals(False)
+        if not variants:
+            self.crop_carousel.hide()
+            self.toast("Нечего улучшать: нет главного объекта и горизонта — оставьте кадр как есть", 8000)
+            return
+        self.crop_carousel.show()
+        what = {"face": "лицо", "person": "человек", "object": "заметный объект", None: "горизонт"}[info["subject"]]
+        self.toast(f"Авто-кадр ({GENRE_RU.get(info['genre'], '')}): главное — {what}. "
+                   "Щелчок — примерить, Enter — применить, Esc — отмена", 10000)
+
+    def on_compose_pick(self, row: int):
+        """Примерка варианта: рамка встаёт на место, сетка переключается на правило варианта."""
+        if row < 0 or not self.crop_mode:
+            return
+        W, H = self.full_wh
+        angle = self.params.get("angle", 0)
+        if row == 0:
+            self.cropper.rect = E.fit_crop(W, H, [0.0, 0.0, 1.0, 1.0], angle)
+            self.toast("Исходный кадр без обрезки", 4000)
+        else:
+            v = self.compose_variants[row - 1]
+            self.cropper.rect = list(v["rect"])
+            self.cropper.aspect = v["aspect"]
+            self.cropper.set_overlay(v["overlay"])
+            self.cropper.flip = v["flip"]
+            self.toast(f"{v['label']}: {v['why']}", 8000)
+        self.view.update()
+        self.on_crop_rect()
+
     # ---------- ИИ-цветокоррекция: карусель вариантов
 
     def start_grade(self):
@@ -2520,6 +2650,8 @@ class MainWindow(QMainWindow):
             for a in (self.a_crop_done, self.a_crop_cancel, self.a_overlay, self.a_overlay_rot):
                 a.setEnabled(True)
             self.a_mask_show.setEnabled(False)
+            self.qbar.hide()  # место под кадром — для вариантов авто-кадра
+            self.view.marks = []  # рамки брака в обрезке мешают
             self.sections["Обрезка и горизонт"].set_expanded(True, emit=False)  # элементы рамки — внутри этой группы
             self.toast("Тяните рамку и её углы; «Горизонт» — поворот. Enter — готово, Esc — отмена", 10000)
         else:
@@ -2528,6 +2660,9 @@ class MainWindow(QMainWindow):
             for a in (self.a_crop_done, self.a_crop_cancel, self.a_overlay, self.a_overlay_rot):
                 a.setEnabled(False)
             self.a_mask_show.setEnabled(True)
+            self.crop_carousel.hide()
+            self.compose_variants = []
+            self.show_quality()
             self._set_crop(self.cropper.rect)
             self.toast("Обрезка применена. Ctrl+Z — отменить")
         self.update_geometry()

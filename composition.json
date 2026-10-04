@@ -1,0 +1,24 @@
+{
+  "_comment": "Авто-кадр (mini_lightroom/composition.py). Веса оценки по жанрам: contain — объект целиком и с полями, anchor — объект на силовой точке правила, headroom — запас над головой, lead — место перед взглядом, horizon — горизонт на линии правила, kept — сколько важного осталось в кадре, size — не терять разрешение. Подстраиваются по отзывам Ивана.",
+  "version": 1,
+  "scales": [1.0, 0.9, 0.8, 0.7, 0.6, 0.5],
+  "aspects": [0, 1.5, 1.3333, 1.25, 1.0, 1.7778],
+  "min_area": 0.25,
+  "margin": 0.03,
+  "variants": 5,
+  "genres": {
+    "portrait": {"contain": 3.0, "anchor": 2.0, "headroom": 1.5, "lead": 1.0, "horizon": 0.3, "kept": 1.0, "size": 0.6},
+    "landscape": {"contain": 1.0, "anchor": 0.6, "headroom": 0.0, "lead": 0.0, "horizon": 3.0, "kept": 1.0, "size": 1.2},
+    "architecture": {"contain": 1.0, "anchor": 0.5, "headroom": 0.0, "lead": 0.0, "horizon": 0.3, "kept": 1.5, "size": 1.5, "symmetry": 1.5},
+    "street": {"contain": 2.0, "anchor": 1.5, "headroom": 1.0, "lead": 1.5, "horizon": 0.5, "kept": 1.0, "size": 0.8},
+    "macro": {"contain": 2.0, "anchor": 1.5, "headroom": 0.0, "lead": 0.5, "horizon": 0.0, "kept": 1.0, "size": 0.8},
+    "other": {"contain": 1.5, "anchor": 1.0, "headroom": 0.5, "lead": 0.5, "horizon": 1.5, "kept": 1.0, "size": 1.0}
+  },
+  "scene_genre": {
+    "portrait": "portrait", "people": "portrait",
+    "landscape": "landscape", "sea": "landscape", "forest": "landscape", "snow": "landscape", "fog": "landscape",
+    "sunset": "landscape", "blue_hour": "landscape",
+    "architecture": "architecture", "interior": "architecture", "night_city": "architecture",
+    "street": "street", "flowers": "macro"
+  }
+}
