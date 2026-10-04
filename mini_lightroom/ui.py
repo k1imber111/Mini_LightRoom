@@ -33,7 +33,6 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QPainterPath,
-    QPalette,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -44,7 +43,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -79,6 +77,8 @@ from .crop_editor import CropEditor
 from .curve_editor import CURVE_SHAPES, CurveEditor
 from .mask_editor import MaskEditor
 from .target_editor import TargetEditor
+from .theme import T, apply_theme, tool_icon
+from .widgets import Section, Toast
 
 APP_DIR = Path(__file__).resolve().parent.parent
 STYLES_DIR = APP_DIR / "styles"
@@ -101,6 +101,7 @@ HSL_COLORS = [("red", "Красный", "#ff4d4d"), ("orange", "Оранжевы
 # Пропорции обрезки: подпись → ширина/высота; "cam" — как снимала камера, "orig" — как у RAW.
 ASPECTS = [("Свободно", None), ("Как в камере", "cam"), ("Исходное", "orig"), ("1:1", 1.0), ("4:5", 0.8),
            ("3:2", 1.5), ("4:3", 4 / 3), ("16:9", 16 / 9)]
+SECTIONS_OPEN = ("ИИ-цветокоррекция", "Автоматика", "Свет", "Цвет")  # остальные группы панели свёрнуты, пока их не раскрыли
 ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 7, 10, 16]  # 1 = 100% (пиксель снимка = пиксель экрана)
 
 
@@ -774,6 +775,7 @@ class MainWindow(QMainWindow):
         # Автосохранение правок: через 1.5 с после шага истории файл правок уже на диске.
         self.save_timer = QTimer(self, singleShot=True, interval=1500, timeout=self.save_sidecar)
         self.settings: dict = E.read_json(SETTINGS_FILE, {})
+        self.sections: dict[str, Section] = {}
         self.editor = MaskEditor(self.ai_arr_for_layer,
                                  (lambda: self.base.shape[:2], lambda m: E.apply_crop(m, *self.display_geo())))
         self.editor.changed.connect(self.on_mask_geom)
@@ -793,8 +795,21 @@ class MainWindow(QMainWindow):
 
     # ---------- построение интерфейса
 
-    def _action(self, text, slot, shortcut=None, tip=""):
+    def _section(self, title: str) -> Section:
+        """Группа панели правок; раскрытое/свёрнутое состояние помним между запусками."""
+        saved = self.settings.get("sections", {})
+        box = Section(title, saved.get(title, title in SECTIONS_OPEN))
+        box.toggled.connect(self._on_section)
+        self.sections[title] = box
+        return box
+
+    def _on_section(self, title: str, on: bool):
+        self.remember(sections={**self.settings.get("sections", {}), title: on})
+
+    def _action(self, text, slot, shortcut=None, tip="", icon=None):
         a = QAction(text, self)
+        if icon:
+            a.setIcon(tool_icon(icon))
         a.triggered.connect(slot)
         if shortcut:
             a.setShortcut(QKeySequence(shortcut))
@@ -805,22 +820,25 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self):
         tb = QToolBar()
         tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        tb.setIconSize(QSize(18, 18))
         self.addToolBar(tb)
-        tb.addAction(self._action("📂  Открыть папку", self.open_folder, "Ctrl+O"))
+        tb.addAction(self._action("Открыть папку", self.open_folder, "Ctrl+O", icon="folder-open"))
         tb.addSeparator()
-        self.a_undo = self._action("↶", self.undo, "Ctrl+Z", "Отменить")
-        self.a_redo = self._action("↷", self.redo, "Ctrl+Y", "Вернуть")
+        self.a_undo = self._action("", self.undo, "Ctrl+Z", "Отменить", icon="arrow-back-up")
+        self.a_redo = self._action("", self.redo, "Ctrl+Y", "Вернуть", icon="arrow-forward-up")
         self.a_redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
         tb.addAction(self.a_undo)
         tb.addAction(self.a_redo)
-        self.a_grade = self._action("🎨 ИИ-цвет", self.start_grade, "G",
-                                    "Варианты цветокоррекции по законам фотографии: ИИ видит, что на кадре")
+        self.a_grade = self._action("ИИ-цвет", self.start_grade, "G",
+                                    "Варианты цветокоррекции по законам фотографии: ИИ видит, что на кадре",
+                                    icon="palette")
         tb.addAction(self.a_grade)
-        self.a_enhance = self._action("✨ ИИ-улучшить", self.ai_enhance, "Shift+A",
-                                      "Одной кнопкой: тон и баланс белого, естественные цвета, ровный горизонт")
+        self.a_enhance = self._action("ИИ-улучшить", self.ai_enhance, "Shift+A",
+                                      "Одной кнопкой: тон и баланс белого, естественные цвета, ровный горизонт",
+                                      icon="sparkles")
         tb.addAction(self.a_enhance)
-        self.a_crop = self._action("✂ Обрезка", self.toggle_crop, "C", "Обрезка и горизонт: рамка на кадре")
+        self.a_crop = self._action("Обрезка", self.toggle_crop, "C", "Обрезка и горизонт: рамка на кадре", icon="crop")
         self.a_crop.setCheckable(True)
         tb.addAction(self.a_crop)
         # Enter/Esc включены только в режиме обрезки: иначе они перехватывали бы Enter в полях ввода.
@@ -829,35 +847,31 @@ class MainWindow(QMainWindow):
         self.a_crop_done.setEnabled(False)
         self.a_crop_cancel.setEnabled(False)
         tb.addSeparator()
-        self.a_auto = self._action("✨ Авто", self.apply_auto, "A", "Подобрать тон и баланс белого под кадр")
-        self.a_reset = self._action("↺ Сброс", self.reset_all, "Ctrl+R", "Сбросить все правки кадра")
-        self.a_compare = self._action("◐ До / после", self.toggle_compare, "\\", "Показать исходник")
+        self.a_auto = self._action("Авто", self.apply_auto, "A", "Подобрать тон и баланс белого под кадр", icon="wand")
+        self.a_reset = self._action("", self.reset_all, "Ctrl+R", "Сбросить все правки кадра", icon="refresh")
+        self.a_compare = self._action("", self.toggle_compare, "\\", "До / после: показать исходник", icon="contrast-2")
         self.a_compare.setCheckable(True)
-        self.a_copy = self._action("Копировать правки", self.copy_settings, "Ctrl+C")
-        self.a_paste = self._action("Вставить в выделенные", self.paste_settings, "Ctrl+V")
-        self.a_match = self._action("🎞 Единый цвет", self.match_series, "Ctrl+Shift+M",
+        self.a_copy = self._action("", self.copy_settings, "Ctrl+C", "Копировать правки", icon="copy")
+        self.a_paste = self._action("", self.paste_settings, "Ctrl+V", "Вставить правки в выделенные кадры", icon="clipboard")
+        self.a_match = self._action("Единый цвет", self.match_series, "Ctrl+Shift+M",
                                     "Выделенные кадры (или всю папку) подогнать под этот: тот же стиль и пресет,\n"
                                     "а экспозиция, баланс белого, контраст и насыщенность — под каждый кадр,\n"
-                                    "чтобы серия выглядела одинаково")
+                                    "чтобы серия выглядела одинаково", icon="adjustments-horizontal")
         for a in (self.a_auto, self.a_reset, self.a_compare, self.a_copy, self.a_paste, self.a_match):
             tb.addAction(a)
-        tb.addSeparator()
-        self.auto_on_open = QCheckBox("Авто для новых кадров")
+        self.auto_on_open = QCheckBox("Авто для новых кадров")  # живут в группе «Автоматика» панели, не в тулбаре
         self.auto_on_open.setChecked(True)
         self.auto_on_open.setToolTip("Кадр без правок при открытии сразу получает «Авто»")
-        tb.addWidget(self.auto_on_open)
-        tb.addSeparator()
-        self.a_scenes = self._action("🔍 Сцены", self.detect_scenes, "Ctrl+Shift+S",
-                                     "Определить сцену каждого кадра: закат, портрет, лес… (ИИ локально на видеокарте)")
+        self.a_scenes = self._action("Сцены", self.detect_scenes, "Ctrl+Shift+S",
+                                     "Определить сцену каждого кадра: закат, портрет, лес… (ИИ локально на видеокарте)",
+                                     icon="scan")
         tb.addAction(self.a_scenes)
         self.scene_auto = QCheckBox("Пресет по сцене")
         self.scene_auto.setChecked(True)
         self.scene_auto.setToolTip("«Авто» и новые кадры получают пресет своей сцены.\n"
                                    "Работает для кадров, у которых сцена уже определена")
-        tb.addWidget(self.scene_auto)
-        tb.addSeparator()
-        self.a_zoom_out = self._action("−", lambda: self.view.step_zoom(-1), "Ctrl+-", "Уменьшить масштаб")
-        self.a_zoom_in = self._action("+", lambda: self.view.step_zoom(1), "Ctrl+=", "Увеличить масштаб")
+        self.a_zoom_out = self._action("", lambda: self.view.step_zoom(-1), "Ctrl+-", "Уменьшить масштаб", icon="minus")
+        self.a_zoom_in = self._action("", lambda: self.view.step_zoom(1), "Ctrl+=", "Увеличить масштаб", icon="plus")
         self.a_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
         self.a_fit = self._action("Вписать", lambda: self.view.set_zoom(None), "Ctrl+0")
         self.a_100 = self._action("100%", lambda: self.view.set_zoom(1.0), "Ctrl+1")
@@ -869,14 +883,13 @@ class MainWindow(QMainWindow):
                                    "перетаскивание — сдвиг,\nдвойной щелчок — 100% / вписать")
         self.zoom_combo.activated.connect(
             lambda i: self.view.set_zoom(None if i == 0 else ZOOM_STEPS[i - 1]))
-        tb.addAction(self.a_zoom_out)
-        tb.addWidget(self.zoom_combo)
-        tb.addAction(self.a_zoom_in)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
-        self.a_export = self._action("⬇  Экспорт…", self.export, "Ctrl+E")
+        self.a_export = self._action("Экспорт…", self.export, "Ctrl+E")
+        self.a_export.setIcon(tool_icon("download", T["on_accent"]))
         tb.addAction(self.a_export)
+        tb.widgetForAction(self.a_export).setObjectName("primary")  # единственная кнопка с заливкой акцентом
 
     def _build_body(self):
         self.strip = QListWidget()
@@ -895,15 +908,17 @@ class MainWindow(QMainWindow):
         self.hist = Histogram()
         pl.addWidget(self.hist)
 
-        box = QGroupBox("ИИ-цветокоррекция")
-        gl = QVBoxLayout(box)
-        b = QPushButton("🎨 Подобрать цвет по правилам (G)")
+        box = self._section("ИИ-цветокоррекция")
+        gl = QVBoxLayout(box.body)
+        b = QPushButton("Подобрать цвет по правилам (G)")
+        b.setIcon(tool_icon("palette"))
         b.setToolTip("ИИ определяет сцену и объекты (кожа, небо, зелень, вода) и строит варианты:\n"
                      "цвета памяти, гармонии цветового круга, тёплое/холодное, фигура и фон, 60-30-10, ч/б.\n"
                      "Варианты — в карусели под кадром, щелчок применяет")
         b.clicked.connect(self.start_grade)
         gl.addWidget(b)
-        b = QPushButton("✨ ИИ-улучшить (Shift+A)")
+        b = QPushButton("ИИ-улучшить (Shift+A)")
+        b.setIcon(tool_icon("sparkles"))
         b.setToolTip("Авто-тон и баланс белого (с пресетом сцены, если включён), цвета памяти — кожа, небо,\n"
                      "зелень — к эталону, горизонт выровнен, если он уверенно найден. Одно Ctrl+Z отменяет всё")
         b.clicked.connect(self.ai_enhance)
@@ -921,8 +936,14 @@ class MainWindow(QMainWindow):
         gl.addWidget(b)
         pl.addWidget(box)
 
-        box = QGroupBox("Обрезка и горизонт")
-        cl = QVBoxLayout(box)
+        box = self._section("Автоматика")
+        al = QVBoxLayout(box.body)
+        al.addWidget(self.auto_on_open)
+        al.addWidget(self.scene_auto)
+        pl.addWidget(box)
+
+        box = self._section("Обрезка и горизонт")
+        cl = QVBoxLayout(box.body)
         row = QHBoxLayout()
         self.aspect_combo = QComboBox()
         for label, _ in ASPECTS:
@@ -930,7 +951,8 @@ class MainWindow(QMainWindow):
         self.aspect_combo.setToolTip("Пропорции рамки. «Как в камере» — формат, выбранный в камере (например 16:9)")
         self.aspect_combo.activated.connect(self.on_aspect)
         row.addWidget(self.aspect_combo, 1)
-        b = QPushButton("↔")
+        b = QPushButton()
+        b.setIcon(tool_icon("arrows-left-right"))
         b.setToolTip("Повернуть рамку: горизонтальная ↔ вертикальная")
         b.setFixedWidth(34)
         b.clicked.connect(self.flip_aspect)
@@ -941,12 +963,14 @@ class MainWindow(QMainWindow):
         self.angle_row.changed.connect(lambda _k, v: self.on_angle(v / 10))
         cl.addWidget(self.angle_row)
         row = QHBoxLayout()
-        b = QPushButton("🤖 Выровнять горизонт")
+        b = QPushButton("Выровнять горизонт")
+        b.setIcon(tool_icon("wand"))
         b.setToolTip("ИИ ищет горизонт, границу неба и вертикали зданий и выравнивает кадр.\n"
                      "Если линии противоречат друг другу — ничего не поворачивает")
         b.clicked.connect(self.ai_horizon)
         row.addWidget(b)
-        b = QPushButton("🤖 Кадр по третям")
+        b = QPushButton("Кадр по третям")
+        b.setIcon(tool_icon("crop"))
         b.setToolTip("Правило третей: главный объект (голова человека или самое заметное место)\n"
                      "встаёт на пересечение третей, горизонт — на треть по высоте")
         b.clicked.connect(self.ai_thirds)
@@ -967,8 +991,8 @@ class MainWindow(QMainWindow):
         groups: dict[str, QVBoxLayout] = {}
         for key, label, lo, hi, group in E.SLIDERS:
             if group not in groups:
-                box = QGroupBox(group)
-                groups[group] = QVBoxLayout(box)
+                box = self._section(group)
+                groups[group] = QVBoxLayout(box.body)
                 pl.addWidget(box)
             row = SliderRow(key, label, lo, hi)
             row.changed.connect(self.on_param)
@@ -990,15 +1014,15 @@ class MainWindow(QMainWindow):
             self.rows[k].setEnabled(G.available())
 
         # Тональная кривая
-        box = QGroupBox("Тональная кривая")
-        cvl = QVBoxLayout(box)
+        box = self._section("Тональная кривая")
+        cvl = QVBoxLayout(box.body)
         row = QHBoxLayout()
         self.curve_btns: dict[str, QPushButton] = {}
         for ch, label in (("rgb", "RGB"), ("r", "R"), ("g", "G"), ("b", "B")):
             b = QPushButton(label)
             b.setCheckable(True)
             b.setAutoExclusive(True)
-            b.setFixedWidth(42)
+            b.setFixedWidth(48)
             b.setToolTip("Общая кривая" if ch == "rgb" else f"Кривая канала {label}: оттенок светов и теней")
             b.clicked.connect(lambda _=False, c=ch: self.curve.set_channel(c))
             row.addWidget(b)
@@ -1010,7 +1034,8 @@ class MainWindow(QMainWindow):
         self.curve_shape.setToolTip("Готовая форма для выбранного канала")
         self.curve_shape.activated.connect(self.on_curve_shape)
         row.addWidget(self.curve_shape, 1)
-        self.tat_curve = QPushButton("🎯")
+        self.tat_curve = QPushButton()
+        self.tat_curve.setIcon(tool_icon("target"))
         self.tat_curve.setCheckable(True)
         self.tat_curve.setFixedWidth(34)
         self.tat_curve.setToolTip("Целевая правка: нажмите на кадре и тяните вверх/вниз —\n"
@@ -1028,8 +1053,8 @@ class MainWindow(QMainWindow):
         pl.addWidget(box)
 
         # HSL: оттенок, насыщенность, яркость по 8 цветам
-        box = QGroupBox("HSL / Цвет")
-        hl = QVBoxLayout(box)
+        box = self._section("HSL / Цвет")
+        hl = QVBoxLayout(box.body)
         tabs = self.hsl_tabs = QTabWidget()
         self.hsl_rows: dict[tuple[str, int], SliderRow] = {}
         tips = ("Сдвиг оттенка цвета: например, зелень в сторону мяты или жёлтого",
@@ -1047,7 +1072,8 @@ class MainWindow(QMainWindow):
             tabs.addTab(w, tab_name)
         hl.addWidget(tabs)
         row = QHBoxLayout()
-        self.tat_hsl = QPushButton("🎯 Тянуть по цвету на кадре")
+        self.tat_hsl = QPushButton("Тянуть по цвету на кадре")
+        self.tat_hsl.setIcon(tool_icon("target"))
         self.tat_hsl.setCheckable(True)
         self.tat_hsl.setToolTip("Целевая правка: нажмите на цвет на кадре и тяните вверх/вниз —\n"
                                 "двигаются ползунки этого цвета на открытой вкладке")
@@ -1060,19 +1086,21 @@ class MainWindow(QMainWindow):
         pl.addWidget(box)
 
         # Маски: локальные правки
-        box = QGroupBox("Маски")
-        ml = QVBoxLayout(box)
+        box = self._section("Маски")
+        ml = QVBoxLayout(box.body)
         row = QHBoxLayout()
         for text, kind, tip in (
-                ("🖌 Кисть", "brush", "Рисуйте по кадру, где нужна правка. Alt — стереть"),
-                ("▤ Линейный", "linear", "Протяните по кадру: сила от начала линии до нуля в конце"),
-                ("◎ Радиальный", "radial", "Протяните от центра: овал, внутри — правка")):
+                ("Кисть", "brush", "Рисуйте по кадру, где нужна правка. Alt — стереть"),
+                ("Линейный", "linear", "Протяните по кадру: сила от начала линии до нуля в конце"),
+                ("Радиальный", "radial", "Протяните от центра: овал, внутри — правка")):
             b = QPushButton(text)
             b.setToolTip(tip)
             b.clicked.connect(lambda _=False, k=kind: self.add_mask(k))
             row.addWidget(b)
         ai_btn = QToolButton()
-        ai_btn.setText("✨ ИИ")
+        ai_btn.setText("ИИ")
+        ai_btn.setIcon(tool_icon("sparkles"))
+        ai_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         ai_btn.setToolTip("Маска по содержимому кадра: небо, люди, зелень, вода, здания (локально на видеокарте)")
         ai_btn.setPopupMode(QToolButton.InstantPopup)
         ai_menu = QMenu(ai_btn)
@@ -1125,8 +1153,8 @@ class MainWindow(QMainWindow):
         pl.addWidget(box)
 
         # Готовые пресеты-образы с силой
-        box = QGroupBox("Пресеты")
-        ll = QVBoxLayout(box)
+        box = self._section("Пресеты")
+        ll = QVBoxLayout(box.body)
         self.look_combo = QComboBox()
         self.look_combo.setIconSize(QSize(64, 44))
         self.look_combo.setMaxVisibleItems(14)
@@ -1138,8 +1166,8 @@ class MainWindow(QMainWindow):
         pl.addWidget(box)
 
         # Стиль с чужого фото
-        box = QGroupBox("Стиль с референса")
-        sl = QVBoxLayout(box)
+        box = self._section("Стиль с референса")
+        sl = QVBoxLayout(box.body)
         top = QHBoxLayout()
         self.style_combo = QComboBox()
         self.style_combo.setIconSize(QSize(48, 32))
@@ -1155,7 +1183,8 @@ class MainWindow(QMainWindow):
         self.style_menu_btn.setMenu(menu)
         top.addWidget(self.style_menu_btn)
         sl.addLayout(top)
-        b = QPushButton("＋ Новый стиль из фото…")
+        b = QPushButton("Новый стиль из фото…")
+        b.setIcon(tool_icon("plus"))
         b.setToolTip("Выберите чужой снимок, цвета и настроение которого нравятся")
         b.clicked.connect(self.new_style)
         sl.addWidget(b)
@@ -1189,8 +1218,8 @@ class MainWindow(QMainWindow):
         pl.addWidget(box)
 
         # Пресеты
-        box = QGroupBox("Мои пресеты")
-        prl = QHBoxLayout(box)
+        box = self._section("Мои пресеты")
+        prl = QHBoxLayout(box.body)
         self.preset_combo = QComboBox()
         self.preset_combo.activated.connect(self.apply_preset)
         prl.addWidget(self.preset_combo, 1)
@@ -1203,7 +1232,8 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(300)
+        scroll.setMinimumWidth(390)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.panel = panel
 
         split = QSplitter()
@@ -1230,8 +1260,9 @@ class MainWindow(QMainWindow):
         split.addWidget(center)
         split.addWidget(scroll)
         split.setStretchFactor(1, 1)
-        split.setSizes([240, 950, 320])
+        split.setSizes([240, 870, 390])
         self.setCentralWidget(split)
+        self.toaster = Toast(self, split)
 
     def _build_status(self):
         self.progress = QProgressBar()
@@ -1243,6 +1274,13 @@ class MainWindow(QMainWindow):
         self.iso_label = QLabel()
         self.iso_label.setStyleSheet("color:#9a9a9a; padding: 0 8px")
         self.statusBar().addPermanentWidget(self.iso_label)
+        for w in (self.a_zoom_out, self.zoom_combo, self.a_zoom_in):  # масштаб — внизу справа, как в фоторедакторах
+            if isinstance(w, QAction):
+                btn = QToolButton()
+                btn.setDefaultAction(w)
+                w = btn
+            self.statusBar().addPermanentWidget(w)
+        self.zoom_combo.setFixedWidth(120)
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().addPermanentWidget(self.cancel_btn)
 
@@ -1255,7 +1293,7 @@ class MainWindow(QMainWindow):
         self.zoom_combo.setEnabled(on)
 
     def toast(self, text, ms=4000):
-        self.statusBar().showMessage(text, ms)
+        self.toaster.show_text(text, ms)
 
     # ---------- сессия: последняя папка и кадр, окно, галочки
 
@@ -1883,7 +1921,7 @@ class MainWindow(QMainWindow):
             self.view.editor = self.targeter
             what = (f"ползунки «{self.hsl_tabs.tabText(self.hsl_tabs.currentIndex())}» цвета под курсором"
                     if mode == "hsl" else "точка кривой для тона под курсором")
-            self.toast(f"🎯 Нажмите на кадре и тяните вверх/вниз — меняется {what}", 10000)
+            self.toast(f"Нажмите на кадре и тяните вверх/вниз — меняется {what}", 10000)
         elif not self.crop_mode:
             self.view.editor = self.editor
         self.view.update()
@@ -1919,7 +1957,7 @@ class MainWindow(QMainWindow):
                          "start": {c: list(cur.get(c, [0, 0, 0])) for c in names}}
             main = max(self._tat["w"], key=self._tat["w"].get)
             label = next(lbl for key, lbl, _ in HSL_COLORS if key == main)
-            self.toast(f"🎯 {label}: тяните вверх — больше, вниз — меньше", 6000)
+            self.toast(f"{label}: тяните вверх — больше, вниз — меньше", 6000)
             return True
         rgb = self.sample_input(pos, ("hsl", "curve"))
         if rgb is None:
@@ -2125,6 +2163,7 @@ class MainWindow(QMainWindow):
             self.view.editor = self.cropper
             self.a_crop_done.setEnabled(True)
             self.a_crop_cancel.setEnabled(True)
+            self.sections["Обрезка и горизонт"].set_expanded(True, emit=False)  # элементы рамки — внутри этой группы
             self.toast("Тяните рамку и её углы; «Горизонт» — поворот. Enter — готово, Esc — отмена", 10000)
         else:
             self.crop_mode = False
@@ -2479,8 +2518,8 @@ class MainWindow(QMainWindow):
             box.setWindowTitle("Единый цвет серии")
             box.setText(f"Кадры не выделены. Подогнать под этот кадр все остальные кадры папки ({len(others)})?\n"
                         "Их правки цвета заменятся, обрезка и маски останутся. Ctrl+Z на каждом кадре вернёт.")
-            yes = box.addButton("✅ Подогнать все", QMessageBox.AcceptRole)
-            box.addButton("❌ Отмена", QMessageBox.RejectRole)
+            yes = box.addButton("Подогнать все", QMessageBox.AcceptRole)
+            box.addButton("Отмена", QMessageBox.RejectRole)
             box.exec()
             if box.clickedButton() is not yes:
                 return
@@ -2645,8 +2684,8 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle("Удалить стиль")
         box.setText(f"Удалить стиль «{name}»?\nКадры с этим стилем останутся без него. Фото-референс не удаляется.")
-        yes = box.addButton("✅ Удалить", QMessageBox.AcceptRole)
-        box.addButton("❌ Отмена", QMessageBox.RejectRole)
+        yes = box.addButton("Удалить", QMessageBox.AcceptRole)
+        box.addButton("Отмена", QMessageBox.RejectRole)
         box.exec()
         if box.clickedButton() is yes:
             self._delete_style(name)
@@ -2873,27 +2912,5 @@ class MainWindow(QMainWindow):
 
 
 def apply_dark_theme(app: QApplication):
-    app.setStyle("Fusion")
-    pal = QPalette()
-    for role, color in [(QPalette.Window, "#232323"), (QPalette.WindowText, "#e6e6e6"),
-                        (QPalette.Base, "#1c1c1c"), (QPalette.AlternateBase, "#262626"),
-                        (QPalette.Text, "#e6e6e6"), (QPalette.Button, "#2e2e2e"),
-                        (QPalette.ButtonText, "#e6e6e6"), (QPalette.Highlight, "#3d7eff"),
-                        (QPalette.HighlightedText, "#ffffff"), (QPalette.ToolTipBase, "#2e2e2e"),
-                        (QPalette.ToolTipText, "#e6e6e6")]:
-        pal.setColor(role, QColor(color))
-    pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor("#6a6a6a"))
-    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor("#6a6a6a"))
-    pal.setColor(QPalette.Disabled, QPalette.Text, QColor("#6a6a6a"))
-    app.setPalette(pal)
-    app.setStyleSheet("""
-        QGroupBox { border: 1px solid #333; border-radius: 6px; margin-top: 14px; padding: 8px 8px 4px; }
-        QGroupBox::title { subcontrol-origin: margin; left: 10px; color: #bdbdbd; }
-        QToolBar { spacing: 4px; padding: 4px; border: none; }
-        QToolButton { padding: 5px 10px; border-radius: 5px; }
-        QToolButton:hover { background: #353535; }
-        QToolButton:checked { background: #3d7eff; }
-        QListWidget { border: none; }
-        QListWidget::item { padding: 4px; }
-        QPushButton { padding: 5px 10px; }
-    """)
+    """Тема окна: токены и QSS — в theme.py (имя оставлено для main.py и тестов)."""
+    apply_theme(app)

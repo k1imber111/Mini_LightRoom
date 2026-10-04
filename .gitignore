@@ -26,6 +26,7 @@ models/
 logs/
 run_*.txt
 .ruff_cache/
+.cache/
 
 # память сессии (последняя папка, окно)
 settings.json
