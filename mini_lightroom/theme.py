@@ -51,31 +51,28 @@ QScrollArea { border: none; background: transparent; }
 QToolBar { background: @window@; border: none; border-bottom: 1px solid @border@; spacing: 4px; padding: 6px 10px; }
 QToolBar::separator { background: @border@; width: 1px; margin: 6px 8px; }
 QToolButton { background: transparent; color: @text2@; border: none; border-radius: 15px; padding: 6px 12px; }
-QToolButton:hover { background: @hover@; color: @text@; }
+QToolButton:hover { color: @text@; }  /* фон — свечение (widgets.HoverGlow) */
 QToolButton:pressed { background: @press@; }
 QToolButton:checked { background: @accent_soft@; color: @accent@; }
 QToolButton:disabled { color: @dim@; background: transparent; }
 QToolButton::menu-indicator { image: none; }
 QToolButton#primary { background: @accent@; color: @on_accent@; font-weight: 600; padding: 6px 16px; }
-QToolButton#primary:hover { background: @accent_hover@; }
 QToolButton#primary:pressed { background: @accent_press@; }
 QToolButton#primary:disabled { background: @control@; color: @dim@; }
 
 QFrame#section { background: @panel@; border: 1px solid @border@; border-radius: 12px; }
 QToolButton#sectionHead { background: transparent; color: @text@; border: none; border-radius: 12px;
     padding: 9px 12px; font-weight: 600; text-align: left; }
-QToolButton#sectionHead:hover { background: @hover@; }
 QToolButton#sectionHead:checked { background: transparent; color: @text@; }
 QFrame#sectionBody { background: transparent; border: none; padding: 2px 12px 12px 12px; }
 
 QPushButton { background: @control@; color: @text@; border: 1px solid @border@; border-radius: 15px;
     padding: 5px 10px; min-height: 20px; }
-QPushButton:hover { background: @hover@; }
+QPushButton:focus { border-color: @accent@; }
 QPushButton:pressed { background: @press@; }
 QPushButton:checked { background: @accent_soft@; color: @accent@; border-color: @accent@; }
 QPushButton:disabled { color: @dim@; background: @window@; }
 QPushButton[primary="true"] { background: @accent@; color: @on_accent@; border: none; font-weight: 600; }
-QPushButton[primary="true"]:hover { background: @accent_hover@; }
 QPushButton[primary="true"]:pressed { background: @accent_press@; }
 
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: @control@; color: @text@; border: 1px solid @border@;
@@ -84,6 +81,13 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: @control@; color: @
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color: @accent@; }
 QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled { color: @dim@; background: @window@; }
 QComboBox { padding-right: 28px; }
+QAbstractSpinBox { padding-right: 24px; }
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button { subcontrol-origin: border; width: 22px; border: none;
+    background: transparent; }
+QAbstractSpinBox::up-button { subcontrol-position: top right; margin-top: 3px; }
+QAbstractSpinBox::down-button { subcontrol-position: bottom right; margin-bottom: 3px; }
+QAbstractSpinBox::up-arrow { image: url(@chev_up@); width: 10px; height: 10px; }
+QAbstractSpinBox::down-arrow { image: url(@chev_down@); width: 10px; height: 10px; }
 QComboBox::drop-down { border: none; width: 28px; }
 QComboBox::down-arrow { image: url(@chev_down@); width: 14px; height: 14px; }
 QComboBox QAbstractItemView { background: @panel@; color: @text@; border: 1px solid @border@; padding: 4px;
@@ -148,7 +152,7 @@ QLabel#qpill[level="doubt"] { background: @warn_soft@; color: @warn@; }
 QLabel#qpill[level="ok"] { background: @ok_soft@; color: @ok@; }
 QPushButton[chip="true"] { min-height: 16px; padding: 3px 10px; border-radius: 12px; background: transparent;
     border: 1px solid @border@; color: @text2@; }
-QPushButton[chip="true"]:hover { background: @hover@; color: @text@; }
+QPushButton[chip="true"]:hover { color: @text@; }
 QPushButton[chip="true"]:checked { background: @accent_soft@; border-color: transparent; color: @accent@; }
 
 QLabel#toast { background: @panel@; color: @text@; border: 1px solid @border@; border-radius: 16px; padding: 8px 16px; }
@@ -217,7 +221,8 @@ def _svg_file(name: str, color: str) -> str:
 
 def build_qss() -> str:
     qss = _QSS
-    tokens = dict(T, chev_down=_svg_file("chevron-down", T["text2"]), check=_svg_file("check", T["on_accent"]))
+    tokens = dict(T, chev_down=_svg_file("chevron-down", T["text2"]), chev_up=_svg_file("chevron-up", T["text2"]),
+                  check=_svg_file("check", T["on_accent"]))
     for key, value in tokens.items():
         qss = qss.replace(f"@{key}@", value)
     return qss

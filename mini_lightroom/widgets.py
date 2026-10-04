@@ -1,12 +1,33 @@
 """Общие виджеты окна: сворачиваемая секция панели и всплывающее уведомление. Без бизнес-логики."""
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, Qt, QTimer, Signal
-from PySide6.QtWidgets import QFrame, QGraphicsOpacityEffect, QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget
+import ctypes
+
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QEvent,
+    QPropertyAnimation,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsOpacityEffect,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from .theme import tool_icon
 
-__all__ = ["Section", "Toast", "set_animations"]
+__all__ = ["HoverGlow", "Section", "Toast", "fade_in", "install_hover", "set_animations", "system_animations"]
 
 ANIMATIONS = True  # False — всё появляется и сворачивается мгновенно
 _MAX = 16777215  # QWIDGETSIZE_MAX
@@ -15,6 +36,90 @@ _MAX = 16777215  # QWIDGETSIZE_MAX
 def set_animations(on: bool) -> None:
     global ANIMATIONS
     ANIMATIONS = on
+
+
+def system_animations() -> bool:
+    """Включены ли анимации в Windows (Параметры → Специальные возможности → Визуальные эффекты)."""
+    try:
+        flag = ctypes.c_int(1)
+        ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(flag), 0)  # SPI_GETCLIENTAREAANIMATION
+        return bool(flag.value)
+    except (AttributeError, OSError):  # не Windows
+        return True
+
+
+def fade_in(w: QWidget, ms: int = 180) -> None:
+    """Мягкое появление виджета: прозрачность 0 → 1, потом эффект снимается (рисование снова обычное)."""
+    if not ANIMATIONS:
+        return
+    fx = QGraphicsOpacityEffect(w)
+    w.setGraphicsEffect(fx)
+    a = QPropertyAnimation(fx, b"opacity", w)
+    a.setDuration(ms)
+    a.setStartValue(0.0)
+    a.setEndValue(1.0)
+    a.setEasingCurve(QEasingCurve.OutCubic)
+    a.finished.connect(lambda: w.setGraphicsEffect(None))
+    a.start(QAbstractAnimation.DeleteWhenStopped)
+
+
+class HoverGlow(QWidget):
+    """Плавное осветление кнопки при наведении. QSS не умеет переходов, поэтому поверх кнопки лежит прозрачный
+    дочерний виджет, который сам рисует полупрозрачную заливку с анимированной силой и не ловит мышь."""
+
+    def __init__(self, btn: QWidget):
+        super().__init__(btn)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.t = 0.0
+        self._anim = QVariantAnimation(self, duration=140, easingCurve=QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._set)
+        btn.installEventFilter(self)
+        self.setGeometry(btn.rect())
+        self.show()
+
+    def _set(self, v) -> None:
+        self.t = float(v)
+        self.update()
+
+    def _to(self, target: float) -> None:
+        self._anim.stop()
+        if not ANIMATIONS:
+            self._set(target)
+            return
+        self._anim.setStartValue(self.t)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Enter:
+            self._to(1.0)
+        elif t in (QEvent.Leave, QEvent.Hide, QEvent.EnabledChange):
+            self._to(0.0)
+        elif t == QEvent.Resize:
+            self.setGeometry(self.parentWidget().rect())
+        return False
+
+    def paintEvent(self, _):
+        btn = self.parentWidget()
+        if self.t < 0.01 or not btn.isEnabled():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, int(32 * self.t)))
+        r = btn.property("glowRadius") or min(btn.height() / 2, 15)
+        p.drawRoundedRect(self.rect(), r, r)
+
+
+def install_hover(root: QWidget) -> None:
+    """Свечение при наведении на все кнопки внутри root (повторный вызов безопасен); у QPushButton фокус только
+    с клавиатуры, чтобы после щелчка мышью на кнопке не оставалось кольца фокуса."""
+    for b in root.findChildren(QPushButton) + root.findChildren(QToolButton):
+        if b.findChild(HoverGlow) is None:
+            HoverGlow(b)
+        if isinstance(b, QPushButton):
+            b.setFocusPolicy(Qt.TabFocus)
 
 
 class Section(QFrame):
@@ -34,6 +139,7 @@ class Section(QFrame):
         self.head.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.head.setCursor(Qt.PointingHandCursor)
         self.head.setToolTip("Свернуть / развернуть")
+        self.head.setProperty("glowRadius", 12)
         self.body = QFrame()
         self.body.setObjectName("sectionBody")
         lay = QVBoxLayout(self)

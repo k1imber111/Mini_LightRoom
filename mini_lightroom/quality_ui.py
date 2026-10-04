@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from .theme import T, tool_icon
+from .widgets import fade_in, install_hover
 
 __all__ = [
     "LEVEL_COLOR",
@@ -216,7 +217,9 @@ class QualityBar(QFrame):
         self.summary.setText(text)
         self.b_reject.setEnabled(flag != "reject")
         self.b_keep.setEnabled(flag != "pick")
-        self.setVisible(True)
+        if not self.isVisible():
+            self.setVisible(True)
+            fade_in(self)
 
     def set_tiles(self, tiles: list[ZoomTile]) -> None:
         while self.tiles.count() > 1:
@@ -306,6 +309,7 @@ class TrashDialog(QDialog):
             lay.addWidget(w, 1 if w is self.list else 0)
         lay.addLayout(row)
         self._recount()
+        install_hover(self)
 
     def chosen(self) -> list[Path]:
         return [Path(self.list.item(i).data(Qt.UserRole)) for i in range(self.list.count())

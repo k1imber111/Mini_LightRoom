@@ -95,7 +95,7 @@ from .quality_ui import (
 )
 from .target_editor import TargetEditor
 from .theme import T, apply_theme, tool_icon
-from .widgets import Section, Toast
+from .widgets import Section, Toast, fade_in, install_hover, set_animations, system_animations
 
 APP_DIR = Path(__file__).resolve().parent.parent
 STYLES_DIR = APP_DIR / "styles"
@@ -757,7 +757,7 @@ class ExportDialog(QDialog):
                                 if N.available() else "Нужны библиотеки ИИ: install_ai.bat")
         self.out = QLineEdit(str(folder / "export"))
         browse = QPushButton("…")
-        browse.setFixedWidth(32)
+        browse.setFixedWidth(44)
         browse.clicked.connect(self._browse)
         out_row = QHBoxLayout()
         out_row.addWidget(self.out)
@@ -766,6 +766,7 @@ class ExportDialog(QDialog):
         hint = QLabel("Кадры без своих настроек получат настройки текущего кадра.")
         hint.setStyleSheet("color:#9a9a9a")
         form = QFormLayout()
+        form.setVerticalSpacing(8)
         form.addRow("Длинная сторона:", self.edge)
         form.addRow("Качество JPEG:", self.quality)
         form.addRow("Увеличение (ИИ):", self.upscale)
@@ -773,14 +774,19 @@ class ExportDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.button(QDialogButtonBox.Ok).setText("Экспортировать")
         btns.button(QDialogButtonBox.Cancel).setText("Отмена")
+        btns.button(QDialogButtonBox.Ok).setProperty("primary", True)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
         for w in (self.r_current, self.r_selected, self.r_all, hint, self.auto, self.scene_look, self.skip_blur):
             lay.addWidget(w)
         lay.addLayout(form)
         lay.addWidget(btns)
+        self.setMinimumWidth(480)
+        install_hover(self)
 
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, "Куда сохранить", self.out.text())
@@ -903,6 +909,7 @@ class MainWindow(QMainWindow):
         self.reload_presets()
         self.reload_looks()
         self._set_enabled(False)
+        install_hover(self)
 
     # ---------- построение интерфейса
 
@@ -913,6 +920,10 @@ class MainWindow(QMainWindow):
         box.toggled.connect(self._on_section)
         self.sections[title] = box
         return box
+
+    def on_anim_toggle(self, on: bool):
+        set_animations(on)
+        self.remember(animations=on)
 
     def _on_section(self, title: str, on: bool):
         self.remember(sections={**self.settings.get("sections", {}), title: on})
@@ -985,6 +996,11 @@ class MainWindow(QMainWindow):
                                       "Проверить резкость, смаз и закрытые глаза у всех кадров папки заново",
                                       icon="focus-2")
         tb.addAction(self.a_quality)
+        self.anim_check = QCheckBox("Плавные анимации")
+        self.anim_check.setChecked(bool(self.settings.get("animations", system_animations())))
+        self.anim_check.setToolTip("Появление сообщений и панелей, подсветка кнопок. По умолчанию — как в настройках Windows")
+        self.anim_check.toggled.connect(self.on_anim_toggle)
+        set_animations(self.anim_check.isChecked())
         self.quality_auto = QCheckBox("Проверять фокус при открытии папки")
         self.quality_auto.setChecked(True)
         self.quality_auto.setToolTip("После загрузки миниатюр в фоне ищется брак: расфокус, смаз, закрытые глаза.\n"
@@ -1026,6 +1042,7 @@ class MainWindow(QMainWindow):
         self.strip.setIconSize(QSize(160, 110))
         self.strip.setSelectionMode(QListWidget.ExtendedSelection)
         self.strip.setMinimumWidth(230)
+        self.strip.setTextElideMode(Qt.ElideMiddle)
         self.strip.currentItemChanged.connect(self.on_select)
 
         self.view = ImageView()
@@ -1070,6 +1087,7 @@ class MainWindow(QMainWindow):
         al.addWidget(self.auto_on_open)
         al.addWidget(self.scene_auto)
         al.addWidget(self.quality_auto)
+        al.addWidget(self.anim_check)
         pl.addWidget(box)
 
         box = self._section("Обрезка и горизонт")
@@ -1592,7 +1610,7 @@ class MainWindow(QMainWindow):
         if it is None:
             return
         level, title, _ = describe(self.quality.get(name), self.flags.get(name))
-        lines = [name]
+        lines = [Path(name).stem]
         if level in ("bad", "doubt") or self.flags.get(name):
             defects = (self.quality.get(name) or {}).get("defects") or []
             why = f" · {SHORT.get(defects[0]['type'], '')}" if defects and not self.flags.get(name) else ""
@@ -2222,6 +2240,7 @@ class MainWindow(QMainWindow):
             self.toast("Нечего улучшать: нет главного объекта и горизонта — оставьте кадр как есть", 8000)
             return
         self.crop_carousel.show()
+        fade_in(self.crop_carousel)
         what = {"face": "лицо", "person": "человек", "object": "заметный объект", None: "горизонт"}[info["subject"]]
         self.toast(f"Авто-кадр ({GENRE_RU.get(info['genre'], '')}): главное — {what}. "
                    "Щелчок — примерить, Enter — применить, Esc — отмена", 10000)
@@ -3418,6 +3437,7 @@ class MainWindow(QMainWindow):
         if self.export_thread:
             self.export_thread.stop = True
             self.export_thread.wait()
+        FC.close()
         super().closeEvent(e)
 
 

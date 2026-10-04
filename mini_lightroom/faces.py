@@ -6,7 +6,6 @@ mediapipe необязателен: без него `available()` — False, п�
 """
 from __future__ import annotations
 
-import atexit
 import contextlib
 import threading
 import urllib.request
@@ -31,6 +30,7 @@ MIN_EYE_PX = 14    # глаз у́же этого на анализируемо�
 _LOCK = threading.Lock()
 _finder: FaceFinder | None = None
 _download_failed = False
+_closed = False
 
 
 def available() -> bool:
@@ -127,7 +127,7 @@ def get_finder(models_dir: Path) -> FaceFinder | None:
     global _finder
     if _finder is not None:
         return _finder
-    if not available():
+    if _closed or not available():
         return None
     global _download_failed
     path = Path(models_dir) / MODEL_FILE
@@ -135,14 +135,16 @@ def get_finder(models_dir: Path) -> FaceFinder | None:
         _download_failed = True  # нет сети — не пытаться заново на каждом кадре
         return None
     _finder = FaceFinder(path.read_bytes())
-    atexit.register(_close)
     return _finder
 
 
-def _close() -> None:
-    """Закрыть модель до остановки интерпретатора: иначе её деструктор mediapipe печатает исключение при выходе."""
-    global _finder
-    if _finder is not None:
-        with contextlib.suppress(Exception):  # выходим: ошибка закрытия уже ничего не меняет
-            _finder._lm.close()
-        _finder = None
+def close() -> None:
+    """Закрыть модель до остановки интерпретатора (вызывает окно при закрытии): иначе деструктор mediapipe при выходе
+    печатает исключение. После закрытия `get_finder` больше ничего не создаёт."""
+    global _finder, _closed
+    with _LOCK:  # не посреди detect()
+        _closed = True
+        if _finder is not None:
+            with contextlib.suppress(Exception):
+                _finder._lm.close()
+            _finder = None

@@ -68,5 +68,19 @@ if __name__ == "__main__":
             win.cropper.set_overlay(kind)
             pump(app, 0.3)
             win.view.grab().save(str(out / f"4_overlay_{kind}.png"))
+        # диалоги: экспорт и корзина
+        dlg = ui.ExportDialog(win, 2, 6, d)
+        dlg.show()
+        pump(app, 0.2)
+        dlg.grab().save(str(out / "5_export_dialog.png"))
+        dlg.close()
+        from mini_lightroom.quality_ui import TrashDialog
+        rows = [(d / f"DSC0{2890 + i}.jpg", win.thumb_pix.get(f"DSC0{2890 + i}.jpg"), "Брак · расфокус", 24_500_000)
+                for i in range(3)]
+        tdlg = TrashDialog(win, rows)
+        tdlg.show()
+        pump(app, 0.2)
+        tdlg.grab().save(str(out / "6_trash_dialog.png"))
+        tdlg.close()
         win.close()
     print("снимки:", *sorted(str(p) for p in out.glob("*.png")), sep="\n")
